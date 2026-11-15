@@ -1,0 +1,13 @@
+{
+  "name": "video-editor",
+  "version-string": "0.1.0",
+  "description": "Basic GPU-accelerated video editor",
+  "dependencies": [
+    { "name": "qtbase", "features": [ "opengl", "vulkan", "widgets" ] },
+    "qtmultimedia",
+    { "name": "ffmpeg", "features": [ "avcodec", "avformat", "swscale", "swresample" ] },
+    "sqlite3",
+    "vulkan-headers",
+    "shaderc"
+  ]
+}

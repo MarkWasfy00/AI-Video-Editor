@@ -1,0 +1,12 @@
+build/
+out/
+.vs/
+.vscode/
+.idea/
+*.user
+CMakeUserPresets.json
+vcpkg_installed/
+dist/
+claude-bridge/node_modules/
+__pycache__/
+*.pyc
