@@ -12,6 +12,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 class QUndoStack;
@@ -98,10 +99,79 @@ struct SpeedPoint {
 QStringList speedCurvePresetNames();
 std::vector<SpeedPoint> speedCurvePreset(const QString& name);   // empty for unknown / "none"
 
+// ---------------------------------------------------------------------------
+// Text overlays (titles, lower thirds, ...): clips on video tracks with no media
+// ---------------------------------------------------------------------------
+struct TextStyle {
+    QString font = QStringLiteral("Segoe UI");
+    QString fontFile;                       // optional .ttf / .otf that provides `font` (not installed)
+    bool bold = true;
+    bool italic = false;
+    bool underline = false;
+    bool uppercase = false;
+    double size = 0.08;                     // text height, fraction of the canvas height
+    QColor color = Qt::white;
+    bool gradient = false;                  // vertical gradient from color (top) to color2 (bottom)
+    QColor color2 = QColor(255, 200, 40);
+    QString align = QStringLiteral("center"); // left | center | right
+    double letterSpacing = 0.0;             // extra space between letters, fraction of the font size
+    double lineSpacing = 1.15;              // line height, multiple of the font height
+    double maxWidth = 0.9;                  // wrap width, fraction of the canvas width
+    QColor outline = Qt::black;
+    double outlineWidth = 0.0;              // fraction of the font size (0 = none)
+    bool shadow = false;
+    QColor shadowColor = QColor(0, 0, 0, 170);
+    double shadowX = 0.04;                  // offset, fraction of the font size
+    double shadowY = 0.06;
+    double shadowBlur = 0.08;               // softness, fraction of the font size (0 = hard)
+    bool background = false;
+    QColor backgroundColor = Qt::black;
+    double backgroundOpacity = 0.6;
+    double backgroundPadding = 0.3;         // fraction of the font size
+    double backgroundRadius = 0.25;         // corner radius, fraction of the font size
+    QString backgroundMode = QStringLiteral("block"); // block (one box) | lines (a box per line)
+
+    QJsonObject toJson() const;
+    static TextStyle fromJson(const QJsonObject& o);
+    static TextStyle fromJson(const QJsonObject& o, const TextStyle& base);
+    bool operator==(const TextStyle&) const = default;
+};
+
+// How a text clip enters, stays and leaves.
+struct TextAnimation {
+    QString in = QStringLiteral("fade");
+    double inDuration = 0.5;                // seconds
+    QString out = QStringLiteral("fade");
+    double outDuration = 0.4;
+    QString loop = QStringLiteral("none");  // while on screen
+    double loopSpeed = 1.0;                 // cycles per second
+
+    QJsonObject toJson() const;
+    static TextAnimation fromJson(const QJsonObject& o);
+    static TextAnimation fromJson(const QJsonObject& o, const TextAnimation& base);
+    bool operator==(const TextAnimation&) const = default;
+};
+QStringList textAnimationsIn();     // none, fade, pop, zoom, slide-up, ... typewriter, words, blur, bounce, drop, spin
+QStringList textAnimationsOut();
+QStringList textAnimationsLoop();   // none, pulse, float, wiggle, blink, shake, rainbow
+
+struct TextData {
+    QString text;
+    TextStyle style;
+    TextAnimation animation;
+    QString templateId;                     // template it was made from (informational)
+
+    QJsonObject toJson() const;
+    static TextData fromJson(const QJsonObject& o);
+    bool operator==(const TextData&) const = default;
+};
+
 struct Clip {
     QString id;
-    QString mediaId;
+    QString mediaId;                        // empty for text clips
     QString name;
+    std::optional<TextData> text;           // set: a text overlay (no media)
+    bool isText() const { return text.has_value(); }
     TimeUs start = 0;              // position on the timeline
     TimeUs in = 0;                 // offset into the source media
     TimeUs duration = 0;           // length on the timeline
@@ -139,6 +209,9 @@ struct Clip {
 
     QJsonObject toJson() const;
     static Clip fromJson(const QJsonObject& o);
+
+private:
+    QJsonObject toJsonBase() const;
 };
 
 // Mixer fader range. kMinGainDb means silence (-inf).
@@ -193,6 +266,7 @@ struct TranscriptSegment {
     QString text;
     std::vector<TranscriptWord> words;   // cleared when the text is edited
     bool edited = false;
+    QHash<QString, QString> translations; // language code -> translated text
 };
 
 struct Transcript {
@@ -212,9 +286,14 @@ struct TimelineLine {
     int segment = -1;
     TimeUs start = 0;              // timeline time
     TimeUs end = 0;
-    QString text;
+    QString text;                      // the translation when one was asked for and exists
     std::vector<TranscriptWord> words; // timeline times
+    QString original;                  // the transcript's own text (differs from `text` when translated)
 };
+
+// Language names for the codes used by transcription / translation / speech ("en", "ar-EG", ...).
+QList<QPair<QString, QString>> subtitleLanguages();   // code, English name
+QString languageName(const QString& code);
 
 // ---------------------------------------------------------------------------
 // On-screen captions (CapCut-style), generated from the transcripts
@@ -232,7 +311,9 @@ struct CaptionStyle {
     double size = 0.065;                    // text height, fraction of the canvas height
     QColor color = Qt::white;
     QColor highlight = QColor(255, 212, 0); // the word being spoken
-    QString highlightMode = QStringLiteral("color"); // color | box | none
+    // color (the spoken word) | box (behind it) | karaoke (fill sweeps through each word as it is sung)
+    // | spoken (every word said so far) | grow (the spoken word bigger) | underline | none
+    QString highlightMode = QStringLiteral("color");
     QColor outline = Qt::black;
     double outlineWidth = 0.14;             // fraction of the font size (0 = none)
     bool shadow = true;
@@ -243,21 +324,29 @@ struct CaptionStyle {
     double offset = 0.10;                   // distance from the edge, fraction of the canvas height
     int wordsPerCaption = 4;                // 0 = the whole line
     int maxLines = 2;
-    QString animation = QStringLiteral("pop"); // pop | fade | none
+    // pop | fade | slide (rise in) | bounce | zoom | reveal (words appear as they are said)
+    // | typewriter (letters typed) | none
+    QString animation = QStringLiteral("pop");
+    QString language;                       // "" = the transcript; else a translation ("en", "ar", ...)
+    bool bilingual = false;                 // with a translation: the original line under it, smaller
+    double delay = 0.0;                     // seconds; moves every caption later (+) or earlier (-)
 
     QJsonObject toJson() const;
     static CaptionStyle fromJson(const QJsonObject& o);
     bool operator==(const CaptionStyle&) const = default;
 };
 
-QStringList captionPresetNames();           // classic, bold, box, neon, minimal, karaoke, arabic
+QStringList captionPresetNames();           // classic, bold, box, neon, minimal, karaoke, arabic, ...
 CaptionStyle captionPreset(const QString& name, const CaptionStyle& base = {});
+QStringList captionHighlightModes();
+QStringList captionAnimations();
 
 // A caption on screen: a few words with their timeline times.
 struct CaptionChunk {
     TimeUs start = 0;
     TimeUs end = 0;
     std::vector<TranscriptWord> words;     // timeline times
+    QString secondary;                     // bilingual: the original line, shown under the words
 };
 
 struct ProjectSettings {
@@ -374,6 +463,9 @@ public:
     // Removes [a, b) on every track; closeGap = shift everything after b left.
     bool removeRange(TimeUs a, TimeUs b, bool closeGap);
     bool updateClip(const Clip& clip);                    // properties only (not position)
+    // A text overlay on a video track (track < 0 = a free video track, created if needed).
+    QString addTextClip(int trackIndex, TimeUs start, TimeUs duration, const TextData& text,
+                        const ClipTransform& transform = {});
     TimeUs maxClipDuration(const Clip& clip) const;       // limited by source length
 
     TimeUs duration() const;
@@ -393,9 +485,19 @@ public:
     bool updateTranscriptSegment(const QString& mediaId, int index, const QString& text, TimeUs start = -1, TimeUs end = -1);
     bool removeTranscriptSegment(const QString& mediaId, int index);
     int insertTranscriptSegment(const QString& mediaId, TimeUs start, TimeUs end, const QString& text);
+    // Timing tools (source times). Moves segments [from, to] (to < 0 = the last) and their words by delta.
+    bool shiftTranscript(const QString& mediaId, TimeUs delta, int from = 0, int to = -1);
+    // Splits a segment at source time `at` (between words when it has word timings). Returns the new index.
+    int splitTranscriptSegment(const QString& mediaId, int index, TimeUs at);
+    bool mergeTranscriptSegments(const QString& mediaId, int index);   // with the next segment
+    // Translations, by segment index (texts.size() must match the segment count).
+    bool setTranscriptTranslation(const QString& mediaId, const QString& language, const QStringList& texts);
+    bool setSegmentTranslation(const QString& mediaId, int index, const QString& language, const QString& text);
+    QStringList translationLanguages() const;            // languages any transcript has a translation for
     QStringList transcribedMedia() const { return m_transcripts.keys(); }
     // Every transcript line heard on the timeline (audio clips), in timeline order.
-    std::vector<TimelineLine> transcriptLines() const;
+    // language: a translation to show instead of the transcript ("" = the transcript itself).
+    std::vector<TimelineLine> transcriptLines(const QString& language = {}) const;
 
     // --- on-screen captions (not part of the undo history)
     const CaptionStyle& captionStyle() const { return m_captions; }

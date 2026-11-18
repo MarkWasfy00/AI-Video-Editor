@@ -1,9 +1,13 @@
 #include "app/ClaudePanel.h"
 
+#include "app/Theme.h"
+
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
+#include <QFrame>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -17,6 +21,8 @@
 #include <QTextBlock>
 #include <QTextBrowser>
 #include <QTextDocument>
+#include <QTextFrame>
+#include <QUrl>
 #include <QVBoxLayout>
 
 #ifdef Q_OS_WIN
@@ -36,6 +42,62 @@ constexpr ModelChoice kModels[] = {
     {"claude-sonnet-5-5", "Sonnet 5.5"},
     {"claude-haiku-5-5", "Haiku 5.5 (fast)"},
 };
+
+const char kError[] = "#e5786b";
+
+// The Claude app sets replies in a serif face; use the closest one installed.
+QFont serifFont()
+{
+    QFont f;
+    f.setFamilies({QStringLiteral("Anthropic Serif"), QStringLiteral("Tiempos Text"), QStringLiteral("Source Serif 4"),
+                   QStringLiteral("Georgia"), QStringLiteral("Cambria")});
+    f.setStyleHint(QFont::Serif);
+    return f;
+}
+
+// The interface face at a size relative to the conversation's serif face.
+QFont sansFont(const QFont& base, qreal scale)
+{
+    QFont f = QGuiApplication::font();
+    f.setPointSizeF(base.pointSizeF() * scale);
+    return f;
+}
+
+QString panelStyleSheet()
+{
+    QString qss = QString::fromLatin1(R"(
+#ClaudePanel { background: @bg; }
+#ClaudePanel QLabel { color: @text; background: transparent; }
+#claudeLog { background: transparent; border: none; padding: 0; color: @text;
+             selection-background-color: @coral; selection-color: white; }
+#claudeComposer { background: @raised; border: 1px solid @line; border-radius: 14px; }
+#claudeInput { background: transparent; border: none; padding: 0; color: @text;
+               selection-background-color: @coral; selection-color: white; }
+#claudeModel { background: transparent; border: none; border-radius: 6px; color: @dim; padding: 4px 22px 4px 6px; }
+#claudeModel:hover { background: @bg; color: @text; }
+#claudeModel::drop-down { border: none; width: 18px; }
+#claudeModel::down-arrow { image: url("@dir/claude-down.png"); width: 9px; height: 9px; }
+#claudeModel QAbstractItemView { background: @raised; color: @text; border: 1px solid @line; padding: 4px;
+                                 selection-background-color: @line; selection-color: @text; }
+#claudeSend { background: @coral; border: none; border-radius: 8px; padding: 0; }
+#claudeSend:hover { background: #e58a6c; }
+#claudeSend:pressed { background: #c4633f; }
+#claudeGhost { background: transparent; border: 1px solid transparent; border-radius: 7px; color: @dim; padding: 4px 9px; }
+#claudeGhost:hover { background: @raised; border-color: @line; color: @text; }
+#claudeGhost:disabled { color: #5e5d59; background: transparent; border-color: transparent; }
+#claudeStatus { font-size: 8pt; }
+#ClaudePanel QScrollBar:vertical { background: transparent; width: 8px; }
+#ClaudePanel QScrollBar::handle:vertical { background: @line; border-radius: 3px; margin: 1px; }
+#ClaudePanel QScrollBar::handle:vertical:hover { background: #55534e; }
+)");
+    const std::pair<const char*, QString> tokens[] = {
+        {"@dir", theme::assetDir()},          {"@bg", theme::kClaudeBg.name()},     {"@raised", theme::kClaudeRaised.name()},
+        {"@line", theme::kClaudeLine.name()}, {"@text", theme::kClaudeText.name()}, {"@dim", theme::kClaudeDim.name()},
+        {"@coral", theme::kClaudeCoral.name()},
+    };
+    for (const auto& [key, value] : tokens) qss.replace(QLatin1String(key), value);
+    return qss;
+}
 
 QString shortValue(const QJsonValue& v)
 {
@@ -105,48 +167,100 @@ ClaudePanel::ClaudePanel(Host host, QWidget* parent)
     : QWidget(parent)
     , m_host(std::move(host))
 {
-    auto* v = new QVBoxLayout(this);
-    v->setContentsMargins(4, 4, 4, 4);
-    v->setSpacing(4);
+    setObjectName(QStringLiteral("ClaudePanel"));
+    setAttribute(Qt::WA_StyledBackground, true);
+    setStyleSheet(panelStyleSheet());
 
+    auto* v = new QVBoxLayout(this);
+    v->setContentsMargins(14, 10, 14, 10);
+    v->setSpacing(8);
+
+    // Header: spark + name, new chat on the right
     auto* top = new QHBoxLayout;
-    m_model = new QComboBox(this);
+    top->setSpacing(8);
+    auto* spark = new QLabel(this);
+    spark->setPixmap(theme::pixmap(theme::Glyph::Spark, theme::kClaudeCoral, 20, devicePixelRatioF()));
+    auto* title = new QLabel(QStringLiteral("Claude"), this);
+    QFont titleFont = serifFont();
+    titleFont.setPointSizeF(13);
+    title->setFont(titleFont);
+    m_newChat = new QPushButton(tr("New chat"), this);
+    m_newChat->setObjectName(QStringLiteral("claudeGhost"));
+    m_newChat->setIcon(theme::icon(theme::Glyph::Plus, theme::kClaudeDim, 14));
+    m_newChat->setIconSize(QSize(14, 14));
+    m_newChat->setCursor(Qt::PointingHandCursor);
+    m_newChat->setToolTip(tr("Start a new conversation (the project is not changed)"));
+    top->addWidget(spark);
+    top->addWidget(title);
+    top->addStretch(1);
+    top->addWidget(m_newChat);
+    v->addLayout(top);
+
+    // Conversation: Claude's replies are set in a serif face, as in the Claude app
+    m_log = new QTextBrowser(this);
+    m_log->setObjectName(QStringLiteral("claudeLog"));
+    m_log->setFrameShape(QFrame::NoFrame);
+    m_log->setAccessibleName(tr("Claude conversation"));
+    m_log->setOpenExternalLinks(true);
+    QFont logFont = serifFont();
+    logFont.setPointSizeF(10.5);
+    m_log->setFont(logFont);
+    QPalette logPal = m_log->palette();
+    logPal.setColor(QPalette::Text, theme::kClaudeText);
+    logPal.setColor(QPalette::Link, theme::kClaudeCoral);
+    logPal.setColor(QPalette::Highlight, theme::kClaudeCoral);
+    m_log->setPalette(logPal);
+    m_log->document()->setDocumentMargin(2);
+    v->addWidget(m_log, 1);
+    showWelcome();
+
+    // Composer: one rounded box holding the message, the model picker and send
+    auto* composer = new QFrame(this);
+    composer->setObjectName(QStringLiteral("claudeComposer"));
+    auto* cv = new QVBoxLayout(composer);
+    cv->setContentsMargins(12, 8, 8, 8);
+    cv->setSpacing(4);
+    m_input = new QPlainTextEdit(composer);
+    m_input->setObjectName(QStringLiteral("claudeInput"));
+    m_input->setFrameShape(QFrame::NoFrame);
+    m_input->setPlaceholderText(tr("How can I help you edit?"));
+    m_input->setToolTip(tr("Enter to send, Shift+Enter for a new line"));
+    m_input->setFixedHeight(m_input->fontMetrics().lineSpacing() * 3 + 10);
+    m_input->installEventFilter(this);
+    m_input->setAccessibleName(tr("Message Claude"));
+    cv->addWidget(m_input);
+
+    auto* bottom = new QHBoxLayout;
+    bottom->setSpacing(6);
+    m_model = new QComboBox(composer);
+    m_model->setObjectName(QStringLiteral("claudeModel"));
+    m_model->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    m_model->setCursor(Qt::PointingHandCursor);
     const QString saved = QSettings().value(QStringLiteral("claude/model"), QString::fromLatin1(kModels[0].id)).toString();
     for (const auto& mc : kModels) {
         m_model->addItem(QString::fromLatin1(mc.label), QString::fromLatin1(mc.id));
         if (saved == QLatin1String(mc.id)) m_model->setCurrentIndex(m_model->count() - 1);
     }
     m_model->setToolTip(tr("Claude model"));
-    m_newChat = new QPushButton(tr("New Chat"), this);
-    m_newChat->setToolTip(tr("Start a new conversation (the project is not changed)"));
-    top->addWidget(m_model, 1);
-    top->addWidget(m_newChat);
-    v->addLayout(top);
-
-    m_log = new QTextBrowser(this);
-    m_log->setAccessibleName(tr("Claude conversation"));
-    m_log->setOpenExternalLinks(true);
-    m_log->document()->setDocumentMargin(6);
-    v->addWidget(m_log, 1);
-    showWelcome();
+    m_sendBtn = new QPushButton(composer);
+    m_sendBtn->setObjectName(QStringLiteral("claudeSend"));
+    m_sendBtn->setFixedSize(32, 32);
+    m_sendBtn->setIconSize(QSize(18, 18));
+    m_sendBtn->setCursor(Qt::PointingHandCursor);
+    m_sendBtn->setAccessibleName(tr("Send to Claude"));
+    bottom->addWidget(m_model);
+    bottom->addStretch(1);
+    bottom->addWidget(m_sendBtn);
+    cv->addLayout(bottom);
+    v->addWidget(composer);
 
     m_status = new QLabel(this);
+    m_status->setObjectName(QStringLiteral("claudeStatus"));
     m_status->setWordWrap(true);
+    m_status->setAlignment(Qt::AlignHCenter);
     m_status->setTextInteractionFlags(Qt::TextSelectableByMouse);
     v->addWidget(m_status);
-
-    auto* bottom = new QHBoxLayout;
-    m_input = new QPlainTextEdit(this);
-    m_input->setPlaceholderText(tr("Message Claude… (Enter to send, Shift+Enter for a new line)"));
-    m_input->setFixedHeight(m_input->fontMetrics().lineSpacing() * 3 + 14);
-    m_input->installEventFilter(this);
-    m_input->setAccessibleName(tr("Message Claude"));
-    m_sendBtn = new QPushButton(tr("Send"), this);
-    m_sendBtn->setFixedHeight(m_input->height());
-    m_sendBtn->setAccessibleName(tr("Send to Claude"));
-    bottom->addWidget(m_input, 1);
-    bottom->addWidget(m_sendBtn);
-    v->addLayout(bottom);
+    setBusy(false);
 
     connect(m_sendBtn, &QPushButton::clicked, this, [this] { m_busy ? stop() : send(); });
     connect(m_newChat, &QPushButton::clicked, this, &ClaudePanel::newChat);
@@ -199,13 +313,13 @@ bool ClaudePanel::eventFilter(QObject* o, QEvent* e)
 void ClaudePanel::setStatus(const QString& text, bool error)
 {
     m_status->setText(text);
-    m_status->setStyleSheet(error ? QStringLiteral("color: #e57373;") : QStringLiteral("color: #a8b0bb;"));
+    m_status->setStyleSheet(QStringLiteral("color: %1;").arg(error ? QLatin1String(kError) : theme::kClaudeDim.name()));
 }
 
 void ClaudePanel::setBusy(bool busy)
 {
     m_busy = busy;
-    m_sendBtn->setText(busy ? tr("Stop") : tr("Send"));
+    m_sendBtn->setIcon(theme::icon(busy ? theme::Glyph::Stop : theme::Glyph::ArrowUp, Qt::white, 18));
     m_sendBtn->setToolTip(busy ? tr("Stop Claude (Esc)") : tr("Send (Enter)"));
     m_newChat->setEnabled(!busy);
 }
@@ -221,19 +335,19 @@ bool ClaudePanel::ensureBridge()
     QString searched;
     const QString script = findBridgeScript(&searched);
     if (node.isEmpty()) {
-        appendNote(tr("Node.js was not found. Install Node.js 18 or newer (nodejs.org), then try again."), "#e57373");
+        appendNote(tr("Node.js was not found. Install Node.js 18 or newer (nodejs.org), then try again."), kError);
         return false;
     }
     if (script.isEmpty()) {
         appendNote(tr("The Claude bridge is not installed. Run <code>npm install</code> in the claude-bridge "
                       "folder next to the editor. Looked in:<br>%1").arg(searched.toHtmlEscaped().replace("\n", "<br>")),
-                   "#e57373");
+                   kError);
         return false;
     }
     const QString url = m_host.mcpUrl ? m_host.mcpUrl() : QString();
     if (url.isEmpty()) {
         appendNote(tr("The editor's MCP server is not running (Tools > Enable MCP Server). Claude needs it to "
-                      "control the editor."), "#e57373");
+                      "control the editor."), kError);
         return false;
     }
 
@@ -254,13 +368,13 @@ bool ClaudePanel::ensureBridge()
                 QString msg = tr("Claude bridge stopped (exit code %1).").arg(code);
                 if (!m_stderrTail.isEmpty()) msg += QStringLiteral("<br><code>%1</code>")
                                                        .arg(m_stderrTail.join("\n").toHtmlEscaped().replace("\n", "<br>"));
-                appendNote(msg, "#e57373");
+                appendNote(msg, kError);
             }
             setBusy(false);
         });
         connect(m_proc, &QProcess::errorOccurred, this, [this](QProcess::ProcessError err) {
             if (err == QProcess::FailedToStart) {
-                appendNote(tr("Could not start Node.js: %1").arg(m_proc->errorString().toHtmlEscaped()), "#e57373");
+                appendNote(tr("Could not start Node.js: %1").arg(m_proc->errorString().toHtmlEscaped()), kError);
                 setBusy(false);
             }
         });
@@ -351,7 +465,7 @@ void ClaudePanel::handle(const QJsonObject& m)
         m_subscription = m.value("apiKeySource").toString() == QLatin1String("none");
         const QString editor = m.value("editor").toString();
         if (editor != QLatin1String("connected"))
-            appendNote(tr("Claude could not connect to the editor's MCP server (status: %1).").arg(editor), "#e57373");
+            appendNote(tr("Claude could not connect to the editor's MCP server (status: %1).").arg(editor), kError);
     } else if (type == QLatin1String("message_start")) {
         finishAssistant();
     } else if (type == QLatin1String("text_delta")) {
@@ -372,7 +486,7 @@ void ClaudePanel::handle(const QJsonObject& m)
         if (m.value("isError").toBool() || sub != QLatin1String("success")) {
             QString why = m.value("text").toString();
             if (why.isEmpty()) why = sub;
-            appendNote(tr("Stopped: %1").arg(why.toHtmlEscaped()), "#e57373");
+            appendNote(tr("Stopped: %1").arg(why.toHtmlEscaped()), kError);
         }
         const int turns = m.value("turns").toInt();
         QString info = (turns == 1 ? tr("1 step · %1 s") : tr("%1 steps · %2 s").arg(turns))
@@ -385,7 +499,7 @@ void ClaudePanel::handle(const QJsonObject& m)
         QString msg = m.value("message").toString();
         if (msg.contains(QLatin1String("login"), Qt::CaseInsensitive) || msg.contains(QLatin1String("API key"), Qt::CaseInsensitive))
             msg += tr("\nSign in by running 'claude' once in a terminal, or set ANTHROPIC_API_KEY.");
-        appendNote(msg.toHtmlEscaped().replace("\n", "<br>"), "#e57373");
+        appendNote(msg.toHtmlEscaped().replace("\n", "<br>"), kError);
         setStatus(tr("Error"), true);
         setBusy(false);
     } else if (type == QLatin1String("status")) {
@@ -412,13 +526,23 @@ void ClaudePanel::scrollToEnd()
 
 void ClaudePanel::showWelcome()
 {
-    m_log->setHtml(tr("<div style='color:#9aa3ad'><p><b>Ask Claude to edit your video.</b> Claude works on the open "
-                      "project with the editor's own tools, so you see every change live and can undo it.</p>"
-                      "<p>For example:</p><ul>"
-                      "<li>Split the selected clip at the playhead</li>"
-                      "<li>Make the second clip black and white with a 1 second fade in</li>"
-                      "<li>Balance the audio so nothing clips</li>"
-                      "<li>Export a 720p MP4 to my Desktop</li></ul></div>"));
+    const QString spark = QUrl::fromLocalFile(theme::assetDir() + QStringLiteral("/spark@2x.png")).toString();
+    const QString sans = QGuiApplication::font().family();
+    QString html = QStringLiteral("<p align='center' style='margin-top:26px'><img src='%1' width='40' height='40'></p>").arg(spark);
+    html += QStringLiteral("<p align='center' style='font-size:16pt; margin-top:6px'>%1</p>").arg(tr("What should we edit?"));
+    html += QStringLiteral("<p align='center' style='font-family:\"%1\"; font-size:9pt; color:%2'>%3</p>")
+                .arg(sans, theme::kClaudeDim.name(),
+                     tr("Claude works on the open project with the editor's own tools, "
+                        "so you see every change live and can undo it."));
+    html += QStringLiteral("<p align='center' style='font-family:\"%1\"; font-size:9pt; color:%2; margin-top:14px'>")
+                .arg(sans, theme::kClaudeText.name());
+    const QStringList examples = {tr("Split the selected clip at the playhead"),
+                                  tr("Make the second clip black and white with a 1 second fade in"),
+                                  tr("Balance the audio so nothing clips"), tr("Export a 720p MP4 to my Desktop")};
+    for (const QString& e : examples)
+        html += QStringLiteral("<span style='color:%1'>&#8250;</span>&nbsp; %2<br>").arg(theme::kClaudeCoral.name(), e.toHtmlEscaped());
+    html += QStringLiteral("</p>");
+    m_log->setHtml(html);
     m_welcome = true;
 }
 
@@ -429,19 +553,22 @@ void ClaudePanel::appendUser(const QString& text)
         m_welcome = false;
     }
     finishAssistant();
+    // The message sits in a dark bubble, indented from the left like in the Claude app.
     QTextCursor c = endCursor();
-    if (!m_log->document()->isEmpty()) c.insertBlock();
-    QTextBlockFormat bf;
-    bf.setBackground(QColor(55, 75, 105));
-    bf.setTopMargin(8);
-    bf.setBottomMargin(4);
-    bf.setLeftMargin(30);
+    QTextFrameFormat ff;
+    ff.setBackground(theme::kClaudeBubble);
+    ff.setBorder(0);
+    ff.setPadding(9);
+    ff.setLeftMargin(34);
+    ff.setTopMargin(10);
+    ff.setBottomMargin(8);
+    c.insertFrame(ff);
     QTextCharFormat cf;
-    cf.setForeground(QColor(235, 240, 248));
-    c.setBlockFormat(bf);
+    cf.setForeground(theme::kClaudeText);
+    cf.setFont(sansFont(m_log->font(), 0.93));
+    c.setBlockFormat(QTextBlockFormat());
     c.setCharFormat(cf);
     c.insertText(text);
-    c.insertBlock(QTextBlockFormat(), QTextCharFormat());
     scrollToEnd();
 }
 
@@ -450,7 +577,8 @@ void ClaudePanel::appendNote(const QString& html, const QString& color)
     finishAssistant();
     QTextCursor c = endCursor();
     if (!m_log->document()->isEmpty()) c.insertBlock(QTextBlockFormat(), QTextCharFormat());
-    c.insertHtml(QStringLiteral("<span style='color:%1'>%2</span>").arg(color, html));
+    c.insertHtml(QStringLiteral("<span style='font-family:\"%1\"; font-size:9pt; color:%2'>%3</span>")
+                     .arg(QGuiApplication::font().family(), color, html));
     c.insertBlock(QTextBlockFormat(), QTextCharFormat());
     scrollToEnd();
 }
@@ -463,12 +591,14 @@ void ClaudePanel::appendToolUse(const QString& id, const QString& name, const QJ
     QTextCursor c = endCursor();
     if (!c.block().text().isEmpty()) c.insertBlock(QTextBlockFormat(), QTextCharFormat());
     QTextCharFormat f;
-    f.setForeground(QColor(150, 160, 175));
-    f.setFontPointSize(m_log->font().pointSizeF() * 0.9);
-    c.insertText(QStringLiteral("▸ "), f);
+    f.setFont(sansFont(m_log->font(), 0.82));
+    f.setForeground(theme::kClaudeDim);
+    QTextCharFormat dot = f;
+    dot.setForeground(theme::kClaudeCoral);
+    c.insertText(QStringLiteral("● "), dot);
     QTextCharFormat nameF = f;
     nameF.setFontWeight(QFont::DemiBold);
-    nameF.setForeground(QColor(130, 180, 230));
+    nameF.setForeground(QColor(194, 192, 182));
     c.insertText(name, nameF);
     if (!args.isEmpty()) c.insertText(QStringLiteral("  ") + args.join(QStringLiteral(", ")), f);
     m_toolMarks.insert(id, c.blockNumber());  // the result mark goes at the end of this line
@@ -486,7 +616,8 @@ void ClaudePanel::appendToolResult(const QJsonObject& m)
         QTextCursor c(m_log->document());
         c.setPosition(block.position() + block.length() - 1);
         QTextCharFormat f;
-        f.setForeground(err ? QColor(229, 115, 115) : QColor(110, 200, 120));
+        f.setFont(sansFont(m_log->font(), 0.82));
+        f.setForeground(err ? QColor(QLatin1String(kError)) : QColor(132, 176, 120));
         c.insertText(err ? QStringLiteral("  ✗") : QStringLiteral("  ✓"), f);
         if (err) {
             QString text = m.value("text").toString().simplified();

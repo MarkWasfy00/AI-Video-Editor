@@ -59,6 +59,9 @@ private:
     QSpinBox* m_words = nullptr;
     QSpinBox* m_lines = nullptr;
     QComboBox* m_animation = nullptr;
+    QComboBox* m_capLanguage = nullptr;    // transcript or a translation
+    QCheckBox* m_bilingual = nullptr;
+    QDoubleSpinBox* m_delay = nullptr;
     QLabel* m_status = nullptr;
     QColor m_colors[4];                // text, highlight, outline, box
 };

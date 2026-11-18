@@ -35,7 +35,10 @@ public:
     static QString scriptPath();  // separate.py next to the editor (or in the source tree)
     static QString uvPath();
     static QString cacheDir();    // separated stems, one folder per source file
-    static bool isInstalled();
+    // The Demucs model chosen in Tools > AI Models ("htdemucs" or "htdemucs_ft").
+    static QString model();
+    static bool isInstalled();                           // the chosen model
+    static bool isInstalled(const QString& model);
 
     // One-time setup: creates the environment with uv, installs PyTorch (CUDA
     // build when an NVIDIA GPU is present) and demucs, and downloads the model.
@@ -66,9 +69,14 @@ public:
         QString error;
     };
 
-    static QString model() { return QStringLiteral("turbo"); }   // large-v3-turbo
-    static QString modelFile();
-    static bool isInstalled();
+    // The model chosen in Tools > AI Models: AiModels id ("whisper-turbo") and
+    // Whisper's own name for it ("turbo" = large-v3-turbo).
+    static QString modelId();
+    static QString model();
+    static QString modelFile(const QString& modelId = {});
+    static double downloadGB();
+    static bool isInstalled();                           // the chosen model
+    static bool isInstalled(const QString& modelId);
     // Installs openai-whisper into the environment (creating it if needed) and
     // downloads the model (~1.6 GB for turbo).
     static bool install(const Progress& progress, QString* error);

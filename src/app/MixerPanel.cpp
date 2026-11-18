@@ -93,7 +93,7 @@ void LevelMeter::paintEvent(QPaintEvent*)
 {
     QPainter p(this);
     const QRect r = rect();
-    p.fillRect(r, QColor(24, 24, 26));
+    p.fillRect(r, QColor(6, 6, 7));
 
     QLinearGradient g(0, yFor(kMeterTop), 0, yFor(kMeterBottom));
     const auto stop = [&](double db) { return (kMeterTop - db) / (kMeterTop - kMeterBottom); };
@@ -117,7 +117,7 @@ void LevelMeter::paintEvent(QPaintEvent*)
     }
 
     // Scale ticks
-    p.setPen(QColor(255, 255, 255, 60));
+    p.setPen(QColor(255, 255, 255, 36));
     for (double db : {0.0, -6.0, -12.0, -24.0, -36.0, -48.0}) {
         const int y = int(yFor(db));
         p.drawLine(0, y, r.width(), y);

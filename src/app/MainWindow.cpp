@@ -2,9 +2,16 @@
 
 #include "api/McpServer.h"
 #include "api/McpTransports.h"
+#include "app/AiModelsDialog.h"
 #include "app/ClaudePanel.h"
+#include "app/UpscaleDialog.h"
+#include "app/Theme.h"
 #include "app/TranscriptPanel.h"
 #include "app/CaptionPanel.h"
+#include "app/SpeechDialog.h"
+#include "app/TextPanel.h"
+#include "app/PreviewInteractor.h"
+#include "media/Speech.h"
 #include "app/ExportDialog.h"
 #include "app/GpuSettingsDialog.h"
 #include "app/Inspector.h"
@@ -19,6 +26,7 @@
 #include "media/HwAccel.h"
 #include "media/MediaProbe.h"
 #include "media/StemSeparator.h"
+#include "media/VideoUpscaler.h"
 #include "media/Waveform.h"
 #include "render/GLPreviewWidget.h"
 #include "render/PreviewEngine.h"
@@ -71,7 +79,7 @@ namespace ve {
 
 namespace {
 // Bump when the default dock layout changes, so older saved layouts are ignored.
-constexpr int kWindowStateVersion = 5;
+constexpr int kWindowStateVersion = 6; // bumped: old saved layouts had the side panels split apart
 const QString kProjectFilter = QObject::tr("Video Editor Project (*.veproj);;JSON Project (*.json)");
 const QString kMediaFilter = QObject::tr(
     "Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mpg *.mpeg *.ts *.mts *.flv *.wmv "
@@ -91,17 +99,32 @@ MainWindow::MainWindow(RenderBackend backend, int mcpPort, QWidget* parent)
 
     createLayout();
     createActions();
+    // Click / drag / resize / rotate pictures and text right in the preview.
+    m_interactor = new PreviewInteractor(
+        m_project,
+        {[this] { return m_timeline->selectedClip(); }, [this](const QString& id) { m_timeline->setSelectedClip(id); },
+         [this](const QString& id) {
+             m_timeline->setSelectedClip(id);
+             m_textDock->show();
+             m_textDock->raise();
+             m_textPanel->focusText();
+         },
+         [this] { return m_playback->isPlaying(); }, [this] { return m_lastFrame; }},
+        this);
     setRenderer(backend);
 
     connect(m_engine, &PreviewEngine::frameReady, this, [this](CompositeFramePtr f) {
         m_lastFrame = f;
         updateDecodeStatus(f);
-        if (m_preview) m_preview->setFrame(std::move(f));
+        if (m_preview) m_preview->setFrame(m_interactor->decorate(f));
     });
+    const auto redecorate = [this] { if (m_preview) m_preview->setFrame(m_interactor->decorate(m_lastFrame)); };
+    connect(m_timeline, &TimelineWidget::selectionChanged, this, redecorate);
+    connect(m_playback, &PlaybackController::playingChanged, this, redecorate);
     connect(m_playback, &PlaybackController::positionChanged, m_timeline, &TimelineWidget::setPlayhead);
     connect(m_playback, &PlaybackController::positionChanged, this, &MainWindow::updateTimecode);
     connect(m_playback, &PlaybackController::playingChanged, this, [this](bool playing) {
-        m_actPlay->setIcon(style()->standardIcon(playing ? QStyle::SP_MediaPause : QStyle::SP_MediaPlay));
+        m_actPlay->setIcon(theme::icon(playing ? theme::Glyph::Pause : theme::Glyph::Play));
         m_actPlay->setText(playing ? tr("Pause") : tr("Play"));
     });
     connect(m_timeline, &TimelineWidget::seekRequested, m_playback, &PlaybackController::seek);
@@ -123,6 +146,7 @@ MainWindow::MainWindow(RenderBackend backend, int mcpPort, QWidget* parent)
     });
     connect(m_playback, &PlaybackController::positionChanged, m_transcript, &TranscriptPanel::setPlayhead);
     connect(m_timeline, &TimelineWidget::selectionChanged, this, &MainWindow::updateLinkActions);
+    connect(m_timeline, &TimelineWidget::selectionChanged, m_textPanel, &TextPanel::setClip);
 
     // Mixer meters (~30 Hz), fed with the audio actually played up to the playhead.
     auto* meterTimer = new QTimer(this);
@@ -158,6 +182,9 @@ MainWindow::MainWindow(RenderBackend backend, int mcpPort, QWidget* parent)
     updateTimecode();
     updateStatus();
     updateLinkActions();
+
+    // Limited hardware: offer the AI models that fit this computer (once per hardware).
+    QTimer::singleShot(900, this, [this] { AiModelsDialog::promptIfLimited(this); });
 }
 
 void MainWindow::resetPanelLayout()
@@ -215,6 +242,13 @@ void MainWindow::arrangeInspectorAndMixer(PanelLayout layout)
         addDockWidget(area, m_captionDock);
         tabifyDockWidget(m_inspectorDock, m_captionDock);
         m_captionDock->show();
+    }
+    if (m_textDock) {
+        m_textDock->setFloating(false);
+        removeDockWidget(m_textDock);
+        addDockWidget(area, m_textDock);
+        tabifyDockWidget(m_inspectorDock, m_textDock);
+        m_textDock->show();
     }
     for (QDockWidget* d : {m_inspectorDock, m_mixerDock, m_claudeDock}) d->show();
 
@@ -319,22 +353,23 @@ void MainWindow::createLayout()
 
     auto* transport = new QWidget(previewPanel);
     auto* th = new QHBoxLayout(transport);
-    th->setContentsMargins(6, 2, 6, 2);
-    auto makeButton = [&](QStyle::StandardPixmap icon, const QString& tip, auto slot) {
+    th->setContentsMargins(10, 5, 10, 5);
+    th->setSpacing(2);
+    auto makeButton = [&](theme::Glyph icon, const QString& tip, auto slot) {
         auto* b = new QToolButton(transport);
-        b->setIcon(style()->standardIcon(icon));
+        b->setIcon(theme::icon(icon));
         b->setToolTip(tip);
         b->setAutoRaise(true);
-        b->setIconSize(QSize(22, 22));
+        b->setIconSize(QSize(20, 20));
         connect(b, &QToolButton::clicked, this, slot);
         th->addWidget(b);
         return b;
     };
-    makeButton(QStyle::SP_MediaSkipBackward, tr("Go to start (Home)"), [this] { m_playback->seek(0); });
-    makeButton(QStyle::SP_MediaSeekBackward, tr("Previous frame (Left)"), [this] { m_playback->stepFrames(-1); });
-    m_playButton = makeButton(QStyle::SP_MediaPlay, tr("Play / Pause (Space)"), [this] { m_playback->togglePlay(); });
-    makeButton(QStyle::SP_MediaSeekForward, tr("Next frame (Right)"), [this] { m_playback->stepFrames(1); });
-    makeButton(QStyle::SP_MediaSkipForward, tr("Go to end (End)"), [this] { m_playback->goToEnd(); });
+    makeButton(theme::Glyph::SkipBack, tr("Go to start (Home)"), [this] { m_playback->seek(0); });
+    makeButton(theme::Glyph::StepBack, tr("Previous frame (Left)"), [this] { m_playback->stepFrames(-1); });
+    m_playButton = makeButton(theme::Glyph::Play, tr("Play / Pause (Space)"), [this] { m_playback->togglePlay(); });
+    makeButton(theme::Glyph::StepForward, tr("Next frame (Right)"), [this] { m_playback->stepFrames(1); });
+    makeButton(theme::Glyph::SkipForward, tr("Go to end (End)"), [this] { m_playback->goToEnd(); });
     th->addSpacing(12);
     m_timecode = new QLabel(transport);
     QFont mono(QStringLiteral("Consolas"));
@@ -358,8 +393,7 @@ void MainWindow::createLayout()
     auto* linkedBtn = new QToolButton(transport);
     linkedBtn->setDefaultAction(m_actLinkedSelection);
     linkedBtn->setToolButtonStyle(Qt::ToolButtonTextOnly);
-    linkedBtn->setStyleSheet(QStringLiteral("QToolButton { padding: 3px 8px; } "
-                                            "QToolButton:checked { background: #3d6fb6; color: white; border-radius: 3px; }"));
+    linkedBtn->setStyleSheet(QStringLiteral("QToolButton { padding: 4px 10px; }"));
     th->addWidget(linkedBtn);
     m_previewLayout->addWidget(transport);
 
@@ -418,9 +452,10 @@ void MainWindow::createLayout()
 
     m_inspector = new Inspector(m_project, this);
     // Docks can be dragged anywhere, placed side by side or stacked inside an
-    // area, tabbed, or floated. Dragging a tab pulls that one panel out.
+    // area, tabbed, or floated. Dragging a group's title bar moves the whole tab
+    // group together; dragging a single tab pulls that one panel out.
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks |
-                   QMainWindow::AllowTabbedDocks);
+                   QMainWindow::AllowTabbedDocks | QMainWindow::GroupedDragging);
 
     auto* inspectorDock = new QDockWidget(tr("Inspector"), this);
     m_inspectorDock = inspectorDock;
@@ -449,7 +484,8 @@ void MainWindow::createLayout()
          [this](const QString& id, const QString& lang, bool isolate, const QString& hints) {
              transcribeClip(id, lang, isolate, hints);
          },
-         [this](const QString& fmt) { exportTranscript(fmt); }},
+         [this](const QString& fmt) { exportTranscript(fmt); }, [this] { importSubtitles(); },
+         [this] { translateSubtitles(); }, [this] { voiceOverSubtitles(); }},
         this);
     m_transcriptDock = new QDockWidget(tr("Transcript"), this);
     m_transcriptDock->setObjectName(QStringLiteral("TranscriptDock"));
@@ -462,6 +498,14 @@ void MainWindow::createLayout()
     m_captionDock->setObjectName(QStringLiteral("CaptionDock"));
     m_captionDock->setWidget(m_captionPanel);
     addDockWidget(Qt::RightDockWidgetArea, m_captionDock);
+
+    // Text overlays (titles, lower thirds, ...)
+    m_textPanel = new TextPanel(m_project, {[this](const QString& tpl) { addText(tpl); },
+                                            [this](const QString& clip) { speakText(clip); }}, this);
+    m_textDock = new QDockWidget(tr("Text"), this);
+    m_textDock->setObjectName(QStringLiteral("TextDock"));
+    m_textDock->setWidget(m_textPanel);
+    addDockWidget(Qt::RightDockWidgetArea, m_textDock);
 
     arrangeInspectorAndMixer(PanelLayout::SideBySide); // default; a saved layout overrides it
 
@@ -559,6 +603,22 @@ void MainWindow::createActions()
         if (requireSelection(&id)) transcribeClip(id);
     });
     clipMenu->addAction(tr("&Auto Captions"), this, &MainWindow::autoCaptions);
+    clipMenu->addAction(tr("Import Su&btitles..."), this, &MainWindow::importSubtitles);
+    clipMenu->addAction(tr("Trans&late Subtitles..."), this, &MainWindow::translateSubtitles);
+    clipMenu->addAction(tr("&Upscale Video (AI)..."), QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_U), this, [this] {
+        QString id;
+        if (requireSelection(&id)) upscaleClip(id);
+    });
+    clipMenu->addSeparator();
+    clipMenu->addAction(tr("Add &Text"), QKeySequence(Qt::CTRL | Qt::Key_T), this, [this] {
+        addText(m_textPanel ? m_textPanel->currentTemplate() : QStringLiteral("title"));
+    });
+    clipMenu->addAction(tr("Text to S&peech..."), QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_T), this, [this] {
+        const QString sel = m_timeline->selectedClip();
+        const Clip* c = m_project->findClip(sel);
+        speakText(c && c->isText() ? sel : QString());
+    });
+    clipMenu->addAction(tr("&Voice-over from Subtitles..."), this, &MainWindow::voiceOverSubtitles);
     clipMenu->addSeparator();
     clipMenu->addAction(tr("Fit to Frame"), this, [this] { fitSelected(false); });
     clipMenu->addAction(tr("Fill Frame"), this, [this] { fitSelected(true); });
@@ -575,7 +635,7 @@ void MainWindow::createActions()
 
     // Playback
     QMenu* play = menuBar()->addMenu(tr("&Playback"));
-    m_actPlay = play->addAction(style()->standardIcon(QStyle::SP_MediaPlay), tr("Play"), QKeySequence(Qt::Key_Space),
+    m_actPlay = play->addAction(theme::icon(theme::Glyph::Play), tr("Play"), QKeySequence(Qt::Key_Space),
                                 m_playback, &PlaybackController::togglePlay);
     connect(m_actPlay, &QAction::changed, this, [this] { m_playButton->setIcon(m_actPlay->icon()); });
     play->addAction(tr("Previous Frame"), QKeySequence(Qt::Key_Left), this, [this] { m_playback->stepFrames(-1); });
@@ -613,6 +673,10 @@ void MainWindow::createActions()
         m_captionDock->show();
         m_captionDock->raise();
     });
+    view->addAction(tr("Te&xt"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_E), this, [this] {
+        m_textDock->show();
+        m_textDock->raise();
+    });
     panels->addAction(tr("&Float Audio Mixer"), this, [this] {
         m_mixerDock->show();
         m_mixerDock->setFloating(true);
@@ -644,6 +708,11 @@ void MainWindow::createActions()
         statusBar()->showMessage(tr("Copied %1").arg(m_mcpHttp->url()), 3000);
     });
     tools->addAction(tr("MCP &Setup Help..."), this, &MainWindow::showMcpHelp);
+    tools->addSeparator();
+    tools->addAction(tr("A&I Models (Recommended for This Computer)..."), this, &MainWindow::aiModelsDialog);
+    m_aiSwitchMenu = tools->addMenu(tr("S&witch AI Model"));
+    m_aiSwitchMenu->setToolTipsVisible(true);
+    connect(m_aiSwitchMenu, &QMenu::aboutToShow, this, &MainWindow::rebuildAiSwitchMenu);
     tools->addSeparator();
     tools->addAction(tr("&Ask Claude..."), this, &MainWindow::showClaude);
 
@@ -682,12 +751,14 @@ bool MainWindow::setRenderer(RenderBackend backend, bool interactive)
     if (!view) view = std::make_unique<GLPreviewWidget>();
 
     if (m_preview) {
+        if (m_interactor) m_interactor->attach(nullptr);
         m_previewLayout->removeWidget(m_preview->widget());
         m_preview.reset();
     }
     m_preview = std::move(view);
     m_previewLayout->insertWidget(0, m_preview->widget(), 1);
-    m_preview->setFrame(m_lastFrame);
+    if (m_interactor) m_interactor->attach(m_preview.get());
+    m_preview->setFrame(m_interactor ? m_interactor->decorate(m_lastFrame) : m_lastFrame);
 
     const bool vk = m_preview->backend() == RenderBackend::Vulkan;
     m_actOpenGL->setChecked(!vk);
@@ -1063,13 +1134,17 @@ void MainWindow::separateAudio(const QString& clipId)
     if (!ok) return;
     const QString keep = choice == choices[1] ? QStringLiteral("voice") : choice == choices[2] ? QStringLiteral("music")
                                                                                               : QStringLiteral("both");
+    if (!checkModelFits(AiTask::Separate)) return;
     bool install = false;
     if (!StemSeparator::isInstalled()) {
+        const AiModel* m = ai::find(StemSeparator::model());
         if (QMessageBox::question(this, tr("Install voice/music separation"),
-                                  tr("This uses the Demucs AI model, which runs on this computer (on the GPU when "
-                                     "possible).\n\nIt needs a one-time setup that downloads Demucs and its model "
-                                     "(about 90 MB), and PyTorch if it is not already on this computer (up to "
-                                     "2.5 GB for the GPU version).\n\nInstall now?")) != QMessageBox::Yes)
+                                  tr("This uses the %1 AI model, which runs on this computer (on the GPU when "
+                                     "possible).\n\nIt needs a one-time setup that downloads Demucs and the model "
+                                     "(about %2 MB), and PyTorch if it is not already on this computer (up to "
+                                     "2.5 GB for the GPU version).\n\nInstall now?")
+                                      .arg(m ? m->name : StemSeparator::model())
+                                      .arg(m ? int(m->downloadGB * 1000) + 5 : 90)) != QMessageBox::Yes)
             return;
         install = true;
     }
@@ -1091,18 +1166,159 @@ void MainWindow::separateAudio(const QString& clipId)
     }
 }
 
+bool MainWindow::checkModelFits(AiTask task)
+{
+    const AiModel* m = ai::find(ai::selected(task));
+    if (!m) return true;
+    const AiAssessment a = ai::assess(*m);
+    if (a.fit != AiFit::TooHeavy && a.fit != AiFit::Unsupported) return true;
+    const QString recId = ai::recommended(task);
+    const AiModel* rec = ai::find(recId);
+    if (!rec || recId == m->id) return true;
+    QMessageBox box(QMessageBox::Warning, ai::taskName(task),
+                    tr("<p><b>%1</b> is too heavy for this computer: %2.</p><p>The recommended model here is "
+                       "<b>%3</b> (%4).</p>").arg(m->name.toHtmlEscaped(), a.reason.toHtmlEscaped(),
+                                                  rec->name.toHtmlEscaped(), rec->requirements.toHtmlEscaped()),
+                    QMessageBox::NoButton, this);
+    QPushButton* use = box.addButton(tr("Use %1").arg(rec->name), QMessageBox::AcceptRole);
+    QPushButton* keep = a.fit == AiFit::Unsupported ? nullptr
+                                                    : box.addButton(tr("Try %1 Anyway").arg(m->name), QMessageBox::DestructiveRole);
+    box.addButton(QMessageBox::Cancel);
+    box.setDefaultButton(use);
+    box.exec();
+    if (box.clickedButton() == use) {
+        ai::setSelected(task, recId);
+        return true;
+    }
+    return keep && box.clickedButton() == keep;
+}
+
+void MainWindow::rebuildAiSwitchMenu()
+{
+    m_aiSwitchMenu->clear();
+    for (AiTask task : ai::tasks()) {
+        m_aiSwitchMenu->addSection(ai::taskName(task));
+        const QString current = ai::selected(task);
+        auto* group = new QActionGroup(m_aiSwitchMenu);
+        int downloaded = 0;
+        for (const AiModel& m : ai::models(task)) {
+            if (!ai::isInstalled(m.id)) continue;
+            ++downloaded;
+            const AiAssessment fit = ai::assess(m);
+            QString label = m.name;
+            if (m.id == ai::recommended(task)) label += tr("  ★ recommended");
+            else if (fit.fit != AiFit::Good) label += QStringLiteral("  — ") + ai::fitLabel(fit.fit);
+            QAction* a = m_aiSwitchMenu->addAction(label);
+            a->setCheckable(true);
+            a->setChecked(m.id == current);
+            a->setToolTip(fit.reason.isEmpty() ? m.description : fit.reason);
+            group->addAction(a);
+            const QString id = m.id, name = m.name;
+            connect(a, &QAction::triggered, this, [this, task, id, name] {
+                ai::setSelected(task, id);
+                statusBar()->showMessage(tr("%1 now uses %2").arg(ai::taskName(task), name), 4000);
+            });
+        }
+        if (!ai::isInstalled(current)) {
+            const AiModel* m = ai::find(current);
+            QAction* a = m_aiSwitchMenu->addAction(downloaded ? tr("Selected: %1 (downloads when first used)").arg(m ? m->name : current)
+                                                              : tr("No model downloaded yet (%1 downloads when first used)")
+                                                                    .arg(m ? m->name : current));
+            a->setEnabled(false);
+        }
+    }
+    m_aiSwitchMenu->addSeparator();
+    m_aiSwitchMenu->addAction(tr("Download or Choose Other Models..."), this, &MainWindow::aiModelsDialog);
+}
+
+void MainWindow::aiModelsDialog()
+{
+    AiModelsDialog dlg(AiModelsDialog::Mode::Settings, this);
+    if (dlg.exec() == QDialog::Accepted) statusBar()->showMessage(tr("AI model choices saved"), 3000);
+}
+
+void MainWindow::upscaleClip(const QString& clipId)
+{
+    int track = -1;
+    const Clip* c = m_project->findClip(clipId, &track);
+    const MediaItem* media = c ? m_project->mediaById(c->mediaId) : nullptr;
+    if (!c || m_project->tracks()[track].isAudio() || !media || !media->info.hasVideo || media->info.isImage) {
+        statusBar()->showMessage(tr("Select a video clip in the timeline to upscale"), 4000);
+        return;
+    }
+    const ProjectSettings& ps = m_project->settings();
+    UpscaleDialog dlg(media->info.width, media->info.height, ps.width, ps.height, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString model = dlg.model();
+    const AiModel* info = ai::find(model);
+    if (!info) return;
+    ai::setSelected(AiTask::Upscale, model);
+
+    const AiAssessment fit = ai::assess(*info);
+    bool force = false;
+    if (fit.fit == AiFit::Unsupported) {
+        const AiModel* rec = ai::find(ai::recommended(AiTask::Upscale));
+        QMessageBox::warning(this, tr("Upscale Video"), tr("%1 cannot run on this computer: %2.\n\nChoose %3 instead.")
+                                                            .arg(info->name, fit.reason, rec ? rec->name : QString()));
+        return;
+    }
+    if (fit.fit == AiFit::TooHeavy) {
+        if (!checkModelFits(AiTask::Upscale)) return;
+        force = ai::selected(AiTask::Upscale) == model;   // "Try anyway"
+        if (!force) {                                      // switched to the recommended model: confirm its settings
+            upscaleClip(clipId);
+            return;
+        }
+    }
+    bool install = false;
+    if (!VideoUpscaler::isInstalled(model)) {
+        const bool torch = !VideoUpscaler::isEnvInstalled();
+        const QString size = info->downloadGB < 0.1 ? tr("%1 MB").arg(int(info->downloadGB * 1000) + 1)
+                                                    : tr("%1 GB").arg(info->downloadGB, 0, 'f', 1);
+        if (QMessageBox::question(this, tr("Install %1").arg(info->name),
+                                  tr("%1 runs on this computer (%2).\n\nIt needs a one-time download of about %3%4."
+                                     "\n\nInstall now?")
+                                      .arg(info->name, info->requirements, size,
+                                           torch ? tr(" plus PyTorch (about 2.5 GB for the GPU version)") : QString())) != QMessageBox::Yes)
+            return;
+        install = true;
+    }
+    try {
+        const QJsonObject r = m_api->videoUpscale(clipId, model, dlg.scale(), dlg.replaceClip(), install, force);
+        if (dlg.setProjectResolution())
+            m_api->projectSetSettings({{"width", r["width"].toInt()}, {"height", r["height"].toInt()}});
+        if (r.contains("clip")) m_timeline->setSelectedClip(r["clip"].toObject()["id"].toString());
+        statusBar()->showMessage(
+            r["cached"].toBool()
+                ? tr("Used the earlier upscale (%1 × %2).").arg(r["width"].toInt()).arg(r["height"].toInt())
+                : tr("Upscaled to %1 × %2 with %3 in %4 s on the %5.")
+                      .arg(r["width"].toInt()).arg(r["height"].toInt()).arg(info->name)
+                      .arg(r["seconds"].toDouble(), 0, 'f', 0)
+                      .arg(r["device"].toString().startsWith(QLatin1String("cuda")) ? tr("GPU") : tr("CPU")),
+            10000);
+    } catch (const ApiError& e) {
+        progressDone();
+        if (!e.message().contains(QLatin1String("cancelled"), Qt::CaseInsensitive))
+            QMessageBox::warning(this, tr("Upscale Video"), e.message());
+    }
+}
+
 void MainWindow::transcribeClip(const QString& clipId, const QString& language, bool isolateVoice, const QString& hints)
 {
     if (clipId.isEmpty() || !m_project->findClip(clipId)) {
         statusBar()->showMessage(tr("Select a clip with speech or singing in the timeline first"), 4000);
         return;
     }
+    if (!checkModelFits(AiTask::Transcribe)) return;
     bool install = false;
     if (!Transcriber::isInstalled()) {
+        const AiModel* m = ai::find(Transcriber::modelId());
         if (QMessageBox::question(this, tr("Install transcription"),
-                                  tr("Transcription uses OpenAI's Whisper (turbo) model on this computer (on the GPU "
-                                     "when possible).\n\nIt needs a one-time download of about 1.6 GB (plus PyTorch "
-                                     "if voice/music separation is not set up yet).\n\nInstall now?")) != QMessageBox::Yes)
+                                  tr("Transcription uses OpenAI's %1 model on this computer (on the GPU "
+                                     "when possible).\n\nIt needs a one-time download of about %2 GB (plus PyTorch "
+                                     "if voice/music separation is not set up yet).\n\nInstall now?")
+                                      .arg(m ? m->name : Transcriber::model())
+                                      .arg(Transcriber::downloadGB(), 0, 'f', 1)) != QMessageBox::Yes)
             return;
         install = true;
     }
@@ -1164,6 +1380,187 @@ void MainWindow::exportTranscript(const QString& format)
         statusBar()->showMessage(tr("Exported %1 lines to %2").arg(r["lines"].toInt()).arg(QDir::toNativeSeparators(path)), 6000);
     } catch (const ApiError& e) {
         QMessageBox::warning(this, tr("Export Transcript"), e.message());
+    }
+}
+
+void MainWindow::addText(const QString& templateId)
+{
+    try {
+        const QJsonObject r = m_api->textAdd(QJsonObject{{"template", templateId.isEmpty() ? QStringLiteral("title") : templateId}});
+        const QString id = r["id"].toString();
+        m_timeline->setSelectedClip(id);
+        m_inspector->setClip(id);
+        m_textPanel->setClip(id);
+        m_textDock->show();
+        m_textDock->raise();
+        statusBar()->showMessage(tr("Text added. Type your words in the Text panel; move it in the Inspector."), 6000);
+    } catch (const ApiError& e) {
+        QMessageBox::warning(this, tr("Add Text"), e.message());
+    }
+}
+
+namespace {
+// Asks before the first use of an engine that needs a download or sends text online.
+bool confirmSpeechEngine(QWidget* parent, const QString& engine, const QString& voice)
+{
+    if (TextToSpeech::isOnline(engine) && !QSettings().value(QStringLiteral("tts/edgeConsent")).toBool()) {
+        if (QMessageBox::question(parent, QObject::tr("Online voices"),
+                                  QObject::tr("Microsoft Edge voices run online: the text is sent to Microsoft's speech "
+                                              "service to make the audio.\n\nUse them?")) != QMessageBox::Yes)
+            return false;
+        QSettings().setValue(QStringLiteral("tts/edgeConsent"), true);
+    }
+    if (!TextToSpeech::isInstalled(engine, engine == QLatin1String("piper") ? voice : QString()) &&
+        engine != QLatin1String("system")) {
+        const QString what = engine == QLatin1String("piper")
+                                 ? QObject::tr("Piper and the voice %1 (about 90 MB the first time, 60 MB per extra voice)").arg(voice)
+                                 : QObject::tr("the Edge voices package (about 1 MB)");
+        if (QMessageBox::question(parent, QObject::tr("Set up text to speech"),
+                                  QObject::tr("This downloads %1 into the editor's private AI environment.\n\nContinue?").arg(what)) !=
+            QMessageBox::Yes)
+            return false;
+    }
+    return true;
+}
+} // namespace
+
+void MainWindow::speakText(const QString& clipId)
+{
+    const Clip* c = m_project->findClip(clipId);
+    const bool fromClip = c && c->isText();
+    SpeechDialog dlg(SpeechDialog::Mode::Text, fromClip ? c->text->text : QString(), {}, {}, this);
+    if (dlg.exec() != QDialog::Accepted || dlg.text().isEmpty()) return;
+    if (!confirmSpeechEngine(this, dlg.engine(), dlg.voice())) return;
+    QJsonObject args{{"text", dlg.text()}, {"engine", dlg.engine()}, {"voice", dlg.voice()}, {"rate", dlg.rate()},
+                     {"install", true}};
+    if (fromClip) args["start"] = usToSeconds(c->start);
+    try {
+        const QJsonObject r = m_api->ttsSpeak(args);
+        statusBar()->showMessage(tr("Voice-over added on %1 (%2 s).")
+                                     .arg(m_project->tracks()[r["track"].toInt()].name)
+                                     .arg(r["duration"].toDouble(), 0, 'f', 1),
+                                 6000);
+    } catch (const ApiError& e) {
+        progressDone();
+        if (!e.message().contains(QLatin1String("cancelled"), Qt::CaseInsensitive))
+            QMessageBox::warning(this, tr("Text to Speech"), e.message());
+    }
+}
+
+void MainWindow::voiceOverSubtitles()
+{
+    if (m_project->transcriptLines().empty()) {
+        QMessageBox::information(this, tr("Voice-over from Subtitles"),
+                                 tr("There are no subtitles yet: transcribe a clip or import subtitles first."));
+        return;
+    }
+    QStringList langs{QString()};
+    langs += m_project->translationLanguages();
+    QString transcriptLang;
+    if (const Transcript* t = m_project->transcript(m_project->transcriptLines().front().mediaId)) transcriptLang = t->language;
+    SpeechDialog dlg(SpeechDialog::Mode::Subtitles, {}, langs, transcriptLang, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    if (!confirmSpeechEngine(this, dlg.engine(), dlg.voice())) return;
+    QJsonObject args{{"language", dlg.language()}, {"engine", dlg.engine()}, {"voice", dlg.voice()}, {"rate", dlg.rate()},
+                     {"install", true}};
+    if (dlg.lowerOriginal()) args["originalVolume"] = dlg.originalVolume();
+    try {
+        const QJsonObject r = m_api->ttsSubtitles(args);
+        statusBar()->showMessage(tr("Voice-over of %n line(s) added on the Voice-over track.", nullptr, r["lines"].toInt()), 8000);
+    } catch (const ApiError& e) {
+        progressDone();
+        if (!e.message().contains(QLatin1String("cancel"), Qt::CaseInsensitive))
+            QMessageBox::warning(this, tr("Voice-over from Subtitles"), e.message());
+    }
+}
+
+void MainWindow::importSubtitles()
+{
+    const QString sel = m_timeline->selectedClip();
+    if (sel.isEmpty() || !m_project->findClip(sel)) {
+        QMessageBox::information(this, tr("Import Subtitles"),
+                                 tr("Select the clip the subtitles belong to (its sound) in the timeline first."));
+        return;
+    }
+    const QString path = QFileDialog::getOpenFileName(this, tr("Import Subtitles"),
+                                                      QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+                                                      tr("Subtitles (*.srt *.vtt *.lrc)"));
+    if (path.isEmpty()) return;
+    bool replace = true;
+    {
+        bool hasTranscript = false;
+        try {
+            hasTranscript = !m_api->transcriptGet(sel)["transcripts"].toArray().isEmpty();
+        } catch (const ApiError&) {   // no transcript yet, or no sound linked (reported by the import)
+        }
+        if (hasTranscript) {
+            const auto b = QMessageBox::question(this, tr("Import Subtitles"),
+                                                 tr("This clip already has a transcript. Replace it with the file?\n\n"
+                                                    "Yes = replace, No = add the subtitles to it."),
+                                                 QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel);
+            if (b == QMessageBox::Cancel) return;
+            replace = b == QMessageBox::Yes;
+        }
+    }
+    try {
+        const QJsonObject r = m_api->transcriptImport(sel, path, replace);
+        m_transcriptDock->show();
+        m_transcriptDock->raise();
+        statusBar()->showMessage(tr("Imported %1 subtitle line(s)%2.")
+                                     .arg(r["imported"].toInt())
+                                     .arg(r["skipped"].toInt() ? tr(" (%1 outside the clip skipped)").arg(r["skipped"].toInt()) : QString()),
+                                 6000);
+    } catch (const ApiError& e) {
+        QMessageBox::warning(this, tr("Import Subtitles"), e.message());
+    }
+}
+
+void MainWindow::translateSubtitles()
+{
+    if (m_project->transcriptLines().empty()) {
+        QMessageBox::information(this, tr("Translate Subtitles"),
+                                 tr("There are no subtitles yet: transcribe a clip or import subtitles first."));
+        return;
+    }
+    QStringList items;
+    QStringList codes;
+    for (const auto& [code, name] : subtitleLanguages()) {
+        items << name;
+        codes << code;
+    }
+    const QString last = QSettings().value(QStringLiteral("translate/last"), QStringLiteral("en")).toString();
+    bool ok = false;
+    const QString pick = QInputDialog::getItem(this, tr("Translate Subtitles"),
+                                               tr("Translate every subtitle line into (offline, NLLB-200):"), items,
+                                               std::max(0, int(codes.indexOf(last))), false, &ok);
+    if (!ok) return;
+    const QString lang = codes[items.indexOf(pick)];
+    QSettings().setValue(QStringLiteral("translate/last"), lang);
+    if (!checkModelFits(AiTask::Translate)) return;
+    bool install = false;
+    if (!Translator::isInstalled()) {
+        if (QMessageBox::question(this, tr("Install translation"),
+                                  tr("Translation runs Meta's NLLB-200 model on this computer (on the GPU when possible).\n\n"
+                                     "It needs a one-time download of about %1 GB (plus PyTorch if no other AI feature "
+                                     "is set up yet).\n\nInstall now?")
+                                      .arg(Translator::downloadGB(), 0, 'f', 1)) != QMessageBox::Yes)
+            return;
+        install = true;
+    }
+    try {
+        const QJsonObject r = m_api->transcriptTranslate(lang, {}, install, true);
+        m_transcriptDock->show();
+        m_transcriptDock->raise();
+        statusBar()->showMessage(tr("Translated %1 line(s) into %2 in %3 s. The captions now show the translation "
+                                    "(Captions panel > Language).")
+                                     .arg(r["lines"].toInt())
+                                     .arg(languageName(lang))
+                                     .arg(r["seconds"].toDouble(), 0, 'f', 1),
+                                 8000);
+    } catch (const ApiError& e) {
+        progressDone();
+        if (!e.message().contains(QLatin1String("cancelled"), Qt::CaseInsensitive))
+            QMessageBox::warning(this, tr("Translate Subtitles"), e.message());
     }
 }
 

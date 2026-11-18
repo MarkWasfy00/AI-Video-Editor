@@ -50,7 +50,7 @@ std::optional<MediaInfo> probe(const QString& path, QString* error)
 QImage thumbnail(const QString& path, const MediaInfo& info, QSize maxSize)
 {
     QImage out(maxSize, QImage::Format_RGB32);
-    out.fill(QColor(40, 40, 46));
+    out.fill(QColor(21, 21, 24));
 
     if (info.hasVideo) {
         VideoDecoder dec;

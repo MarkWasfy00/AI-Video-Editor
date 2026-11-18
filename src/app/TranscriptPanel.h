@@ -28,6 +28,9 @@ public:
         std::function<QString()> selectedClip;
         std::function<void(const QString& clipId, const QString& language, bool isolateVoice, const QString& hints)> transcribe;
         std::function<void(const QString& format)> exportAs;
+        std::function<void()> importSubtitles;
+        std::function<void()> translate;
+        std::function<void()> voiceOver;
     };
 
     TranscriptPanel(Project* project, Host host, QWidget* parent = nullptr);
@@ -40,6 +43,10 @@ private:
     void updateCurrent();
     int lineAt(TimeUs t) const;
     bool isEditing() const;
+    QString translationLanguage() const;     // shown in the Translation column ("" = none)
+    // Sets a line's timeline start / end (either may be -1 = keep); converted to source time.
+    void setLineTimes(int row, TimeUs start, TimeUs end);
+    void shiftDialog(int row);               // row < 0: every line
 
     Project* m_project;
     Host m_host;
@@ -48,6 +55,7 @@ private:
     QCheckBox* m_isolate = nullptr;
     QLineEdit* m_hints = nullptr;
     QToolButton* m_export = nullptr;
+    QComboBox* m_showLang = nullptr;
     QCheckBox* m_follow = nullptr;
     QCheckBox* m_captions = nullptr;
     QLabel* m_lyric = nullptr;

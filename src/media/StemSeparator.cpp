@@ -1,6 +1,9 @@
 #include "media/StemSeparator.h"
 
 #include "media/AudioDecoder.h"
+#include "media/PythonTask.h"
+#include "media/AiModels.h"
+#include "media/SystemProfile.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -24,69 +27,8 @@ namespace {
 
 constexpr int kRate = 44100;
 
-struct RunResult {
-    int exitCode = -1;
-    bool cancelled = false;
-    QStringList stderrTail;
-};
-
-// Runs a process while keeping the event loop alive. Each stdout line is
-// passed to onLine; `progress` is polled so the user can cancel at any time.
-RunResult runProcess(const QString& program, const QStringList& args, const QProcessEnvironment& env,
-                     const std::function<void(const QString&)>& onLine, const StemSeparator::Progress& progress,
-                     QString* status, double* fraction)
-{
-    RunResult r;
-    QProcess proc;
-    proc.setProcessEnvironment(env);
-    QEventLoop loop;
-    QByteArray outBuf, errBuf;
-    auto drainLines = [](QByteArray& buf, const std::function<void(const QString&)>& fn) {
-        int nl;
-        while ((nl = buf.indexOf('\n')) >= 0) {
-            const QString line = QString::fromUtf8(buf.left(nl)).trimmed();
-            buf.remove(0, nl + 1);
-            if (!line.isEmpty()) fn(line);
-        }
-    };
-    QObject::connect(&proc, &QProcess::readyReadStandardOutput, &loop, [&] {
-        outBuf += proc.readAllStandardOutput();
-        drainLines(outBuf, onLine);
-    });
-    QObject::connect(&proc, &QProcess::readyReadStandardError, &loop, [&] {
-        errBuf += proc.readAllStandardError().replace('\r', '\n');
-        drainLines(errBuf, [&](const QString& l) {
-            r.stderrTail << l;
-            while (r.stderrTail.size() > 15) r.stderrTail.removeFirst();
-        });
-    });
-    QObject::connect(&proc, &QProcess::finished, &loop, &QEventLoop::quit);
-    QObject::connect(&proc, &QProcess::errorOccurred, &loop, [&](QProcess::ProcessError e) {
-        if (e == QProcess::FailedToStart) {
-            r.stderrTail << QStringLiteral("Could not start %1: %2").arg(program, proc.errorString());
-            loop.quit();
-        }
-    });
-    QTimer poll;
-    QObject::connect(&poll, &QTimer::timeout, &loop, [&] {
-        if (progress && !progress(*status, *fraction)) {
-            r.cancelled = true;
-            proc.kill();
-        }
-    });
-    poll.start(100);
-#ifdef Q_OS_WIN
-    proc.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* a) { a->flags |= 0x08000000; }); // no console
-#endif
-    proc.start(program, args);
-    if (!(proc.state() == QProcess::NotRunning && proc.error() == QProcess::FailedToStart)) loop.exec();
-    if (proc.state() != QProcess::NotRunning) proc.waitForFinished(5000);
-    outBuf += proc.readAllStandardOutput();
-    outBuf += '\n';
-    drainLines(outBuf, onLine);
-    r.exitCode = proc.exitStatus() == QProcess::NormalExit ? proc.exitCode() : -1;
-    return r;
-}
+using RunResult = PythonTaskResult;
+const auto runProcess = &runPythonTask;
 
 QProcessEnvironment separatorEnv()
 {
@@ -100,15 +42,24 @@ QProcessEnvironment separatorEnv()
     return env;
 }
 
-bool hasNvidiaGpu()
+bool hasNvidiaGpu() { return SystemProfile::current().hasNvidia(); }
+
+QString modelMarker(const QString& model) { return StemSeparator::envDir() + QStringLiteral("/models/") + model + QStringLiteral(".ok"); }
+
+bool sitePackage(const QString& package)
 {
-    if (!QStandardPaths::findExecutable(QStringLiteral("nvidia-smi")).isEmpty()) return true;
 #ifdef Q_OS_WIN
-    return QFileInfo::exists(QStringLiteral("C:/Windows/System32/nvidia-smi.exe"));
+    return QFileInfo::exists(StemSeparator::envDir() + QStringLiteral("/.venv/Lib/site-packages/") + package + QStringLiteral("/__init__.py"));
 #else
+    QDirIterator it(StemSeparator::envDir() + QStringLiteral("/.venv/lib"), {QStringLiteral("__init__.py")},
+                    QDir::Files, QDirIterator::Subdirectories);
+    while (it.hasNext())
+        if (it.next().endsWith(QLatin1Char('/') + package + QStringLiteral("/__init__.py"))) return true;
     return false;
 #endif
 }
+
+bool demucsPackageInstalled() { return QFileInfo::exists(StemSeparator::pythonPath()) && sitePackage(QStringLiteral("demucs")); }
 
 } // namespace
 
@@ -158,9 +109,22 @@ QString StemSeparator::cacheDir()
     return QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QStringLiteral("/VideoEditor/separated");
 }
 
+QString StemSeparator::model()
+{
+    return ai::selected(AiTask::Separate);
+}
+
 bool StemSeparator::isInstalled()
 {
+    return isInstalled(model());
+}
+
+bool StemSeparator::isInstalled(const QString& model)
+{
     if (!QFileInfo::exists(pythonPath())) return false;
+    if (QFileInfo::exists(modelMarker(model))) return true;
+    if (model != QLatin1String("htdemucs")) return false;
+    // Installed before models were selectable: htdemucs is the only checkpoint there.
     QDirIterator it(envDir() + QStringLiteral("/torch/hub/checkpoints"), {QStringLiteral("*.th")}, QDir::Files);
     return it.hasNext();
 }
@@ -189,9 +153,13 @@ bool StemSeparator::install(const Progress& progress, QString* error)
         return false;
     };
 
+    const QString demucsModel = model();
+    RunResult r;
+    // The environment is already there when only another Demucs model is added.
+    if (!demucsPackageInstalled()) {
     status = QObject::tr("Creating the Python environment...");
     fraction = 0.05;
-    RunResult r = runProcess(uv, {QStringLiteral("venv"), QStringLiteral("--allow-existing"), QStringLiteral("--python"),
+    r = runProcess(uv, {QStringLiteral("venv"), QStringLiteral("--allow-existing"), QStringLiteral("--python"),
                                   QStringLiteral("3.12"), envDir() + QStringLiteral("/.venv")},
                              env, lineToStatus, progress, &status, &fraction);
     if (r.exitCode != 0) return fail(r, QObject::tr("Creating the environment"));
@@ -211,11 +179,14 @@ bool StemSeparator::install(const Progress& progress, QString* error)
          << QStringLiteral("--index-strategy") << QStringLiteral("unsafe-best-match");
     r = runProcess(uv, args, env, lineToStatus, progress, &status, &fraction);
     if (r.exitCode != 0) return fail(r, QObject::tr("Installing PyTorch and Demucs"));
+    }
 
-    status = QObject::tr("Downloading the separation model (about 80 MB)...");
+    const AiModel* info = ai::find(demucsModel);
+    status = QObject::tr("Downloading the separation model %1 (about %2 MB)...")
+                 .arg(info ? info->name : demucsModel).arg(info ? int(info->downloadGB * 1000) : 80);
     fraction = 0.8;
     QString pyError;
-    r = runProcess(pythonPath(), {QStringLiteral("-I"), script, QStringLiteral("--download-only")}, env,
+    r = runProcess(pythonPath(), {QStringLiteral("-I"), script, QStringLiteral("--download-only"), QStringLiteral("--model"), demucsModel}, env,
                    [&](const QString& l) {
                        const QJsonObject o = QJsonDocument::fromJson(l.toUtf8()).object();
                        if (o.value("type").toString() == QLatin1String("error")) pyError = o.value("message").toString();
@@ -225,8 +196,11 @@ bool StemSeparator::install(const Progress& progress, QString* error)
         if (!pyError.isEmpty() && error) *error = pyError;
         return pyError.isEmpty() ? fail(r, QObject::tr("Downloading the model")) : false;
     }
+    QDir().mkpath(envDir() + QStringLiteral("/models"));
+    QFile marker(modelMarker(demucsModel));
+    if (marker.open(QIODevice::WriteOnly)) marker.write("ok");
     if (progress) progress(QObject::tr("Ready"), 1.0);
-    return isInstalled();
+    return isInstalled(demucsModel);
 }
 
 StemSeparator::Result StemSeparator::separate(const QString& input, const QString& outDir, const Progress& progress)
@@ -245,7 +219,7 @@ StemSeparator::Result StemSeparator::separate(const QString& input, const QStrin
     double fraction = 0.0;
     QString pyError;
     const RunResult r = runProcess(
-        pythonPath(), {QStringLiteral("-I"), script, input, outDir}, separatorEnv(),
+        pythonPath(), {QStringLiteral("-I"), script, input, outDir, QStringLiteral("--model"), model()}, separatorEnv(),
         [&](const QString& l) {
             const QJsonObject o = QJsonDocument::fromJson(l.toUtf8()).object();
             const QString type = o.value("type").toString();
@@ -311,23 +285,39 @@ bool StemSeparator::decodeToWav(const QString& mediaPath, TimeUs duration, const
 // ---------------------------------------------------------------------------
 // Transcriber (Whisper)
 // ---------------------------------------------------------------------------
-QString Transcriber::modelFile()
+QString Transcriber::modelId()
 {
-    return StemSeparator::envDir() + QStringLiteral("/whisper/large-v3-turbo.pt");
+    return ai::selected(AiTask::Transcribe);
+}
+
+QString Transcriber::model()
+{
+    QString id = modelId();
+    return id.startsWith(QLatin1String("whisper-")) ? id.mid(8) : QStringLiteral("turbo");
+}
+
+QString Transcriber::modelFile(const QString& id)
+{
+    const QString name = (id.isEmpty() ? modelId() : id).mid(8);   // "whisper-small" -> "small"
+    const QString file = name == QLatin1String("turbo") ? QStringLiteral("large-v3-turbo") : name;
+    return StemSeparator::envDir() + QStringLiteral("/whisper/") + file + QStringLiteral(".pt");
+}
+
+double Transcriber::downloadGB()
+{
+    const AiModel* m = ai::find(modelId());
+    return m ? m->downloadGB : 1.6;
 }
 
 bool Transcriber::isInstalled()
 {
-    if (!QFileInfo::exists(StemSeparator::pythonPath()) || !QFileInfo::exists(modelFile())) return false;
-#ifdef Q_OS_WIN
-    return QFileInfo::exists(StemSeparator::envDir() + QStringLiteral("/.venv/Lib/site-packages/whisper/__init__.py"));
-#else
-    QDirIterator it(StemSeparator::envDir() + QStringLiteral("/.venv/lib"), {QStringLiteral("__init__.py")},
-                    QDir::Files, QDirIterator::Subdirectories);
-    while (it.hasNext())
-        if (it.next().endsWith(QLatin1String("/whisper/__init__.py"))) return true;
-    return false;
-#endif
+    return isInstalled(modelId());
+}
+
+bool Transcriber::isInstalled(const QString& id)
+{
+    return QFileInfo::exists(StemSeparator::pythonPath()) && QFileInfo::exists(modelFile(id)) &&
+           sitePackage(QStringLiteral("whisper"));
 }
 
 bool Transcriber::install(const Progress& progress, QString* error)
@@ -347,7 +337,9 @@ bool Transcriber::install(const Progress& progress, QString* error)
     const QProcessEnvironment env = separatorEnv();
     QString status = QObject::tr("Installing Whisper...");
     double fraction = 0.1;
-    RunResult r = runProcess(uv, {QStringLiteral("pip"), QStringLiteral("install"), QStringLiteral("--python"),
+    RunResult r;
+    if (sitePackage(QStringLiteral("whisper"))) r.exitCode = 0;   // only a new model to download
+    else r = runProcess(uv, {QStringLiteral("pip"), QStringLiteral("install"), QStringLiteral("--python"),
                                   StemSeparator::pythonPath(), QStringLiteral("openai-whisper==20250625")},
                              env, [&](const QString& l) { status = l.left(160); }, progress, &status, &fraction);
     if (r.exitCode != 0) {
@@ -355,10 +347,11 @@ bool Transcriber::install(const Progress& progress, QString* error)
                                         : QObject::tr("Installing Whisper failed:\n%1").arg(r.stderrTail.join(QLatin1Char('\n')));
         return false;
     }
-    status = QObject::tr("Downloading the Whisper model (about 1.6 GB)...");
+    status = QObject::tr("Downloading the Whisper model %1 (about %2 GB)...").arg(model()).arg(downloadGB(), 0, 'f', 1);
     fraction = -1;
     QString pyError;
-    r = runProcess(StemSeparator::pythonPath(), {QStringLiteral("-I"), script, QStringLiteral("--download-only")}, env,
+    r = runProcess(StemSeparator::pythonPath(),
+                   {QStringLiteral("-I"), script, QStringLiteral("--download-only"), QStringLiteral("--model"), model()}, env,
                    [&](const QString& l) {
                        const QJsonObject o = QJsonDocument::fromJson(l.toUtf8()).object();
                        if (o.value("type").toString() == QLatin1String("error")) pyError = o.value("message").toString();

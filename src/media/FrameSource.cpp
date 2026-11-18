@@ -28,6 +28,14 @@ CompositeFramePtr FrameSource::build(const TimelineSnapshot& s, TimeUs t)
         for (const auto& clip : ti->clips) {
             if (clip.start > t) break; // clips are sorted
             if (!clip.contains(t)) continue;
+            if (clip.isText()) {                       // titles / text overlays
+                Layer text;
+                if (m_text.layerFor(clip, s.settings, t, text)) {
+                    text.clipId = clip.id;
+                    out->layers.push_back(std::move(text));
+                }
+                continue;
+            }
             const auto mit = s.media.constFind(clip.mediaId);
             if (mit == s.media.constEnd() || !mit->info.hasVideo) continue;
             VideoDecoder* dec = decoderFor(clip, *mit);
@@ -41,6 +49,7 @@ CompositeFramePtr FrameSource::build(const TimelineSnapshot& s, TimeUs t)
             layer.transform = clip.transform;
             layer.effects = clip.effects;
             layer.opacity = clip.transform.opacity * clip.fadeFactor(t);
+            layer.clipId = clip.id;
             out->layers.push_back(std::move(layer));
         }
     }

@@ -1,11 +1,15 @@
 #include "api/EditorApi.h"
 
 #include "core/ProjectStore.h"
+#include "core/TextTemplates.h"
 #include "media/Exporter.h"
 #include "media/FrameSource.h"
 #include "media/HwAccel.h"
 #include "media/MediaProbe.h"
+#include "media/Speech.h"
 #include "media/StemSeparator.h"
+#include "media/AiModels.h"
+#include "media/VideoUpscaler.h"
 #include "render/CaptionRenderer.h"
 #include "render/GpuInfo.h"
 #include "render/OffscreenRenderer.h"
@@ -20,6 +24,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFontDatabase>
+#include <QJsonDocument>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QUndoStack>
 
@@ -83,9 +89,10 @@ int EditorApi::requireTrack(int index) const
 QJsonObject EditorApi::clipToJson(const Clip& c, int track) const
 {
     const MediaItem* m = m_project->mediaById(c.mediaId);
-    return {
+    QJsonObject o = {
         {"id", c.id},
         {"name", c.name},
+        {"kind", c.isText() ? "text" : "media"},
         {"mediaId", c.mediaId},
         {"mediaPath", m ? m->path : QString()},
         {"track", track},
@@ -112,6 +119,8 @@ QJsonObject EditorApi::clipToJson(const Clip& c, int track) const
         {"fadeIn", toSec(c.fadeIn)},
         {"fadeOut", toSec(c.fadeOut)},
     };
+    if (c.isText()) o["text"] = c.text->toJson();
+    return o;
 }
 
 QJsonObject EditorApi::mediaToJson(const MediaItem& m) const
@@ -569,6 +578,7 @@ QJsonObject EditorApi::clipSetSpeed(const QString& id, const QJsonObject& o)
 {
     const Clip& c = requireClip(id);
     if (c.freeze) throw ApiError(QStringLiteral("A freeze frame has no speed"));
+    if (c.isText()) throw ApiError(QStringLiteral("Text clips have no speed (change the animation durations instead)"));
     const double speed = clampNum(o, "speed", c.speed, 0.05, 16);
     std::vector<SpeedPoint> curve = c.speedCurve;
     QString preset = c.curvePreset;
@@ -601,7 +611,7 @@ QJsonObject EditorApi::clipSetSpeed(const QString& id, const QJsonObject& o)
 
 QJsonObject EditorApi::clipReverse(const QString& id, bool reverse, bool linked)
 {
-    requireClip(id);
+    if (requireClip(id).isText()) throw ApiError(QStringLiteral("Text clips cannot be reversed"));
     m_project->edit(reverse ? QStringLiteral("Reverse clip") : QStringLiteral("Play forward"),
                     [&] { m_project->setClipReverse(id, reverse, linked); });
     return clipGet(id);
@@ -611,7 +621,7 @@ QJsonObject EditorApi::clipFreezeFrame(const QString& id, double time, double ho
 {
     int ti = -1;
     const Clip& c = requireClip(id, &ti);
-    if (m_project->tracks()[ti].isAudio()) throw ApiError(QStringLiteral("Freeze frames are made from video clips"));
+    if (m_project->tracks()[ti].isAudio() || c.isText()) throw ApiError(QStringLiteral("Freeze frames are made from video clips"));
     const TimeUs t = time < 0 ? m_host->playhead() : toUs(time);
     if (!c.contains(t)) throw ApiError(QStringLiteral("Time must lie inside the clip (%1 - %2 s)")
                                            .arg(toSec(c.start)).arg(toSec(c.end())));
@@ -683,8 +693,10 @@ std::pair<QString, QString> EditorApi::stemFiles(const QString& mediaPath, TimeU
     const auto progress = [this](const QString& t, double f) { return m_host->reportProgress(t, f); };
     // Stems are cached per source file (path + size + modification time).
     const QFileInfo fi(mediaPath);
+    const QString demucs = StemSeparator::model();   // htdemucs keeps the cache of earlier versions
     const QByteArray key = QCryptographicHash::hash(
-        (fi.absoluteFilePath() + QString::number(fi.size()) + fi.lastModified().toString(Qt::ISODate)).toUtf8(),
+        (fi.absoluteFilePath() + QString::number(fi.size()) + fi.lastModified().toString(Qt::ISODate) +
+         (demucs == QLatin1String("htdemucs") ? QString() : demucs)).toUtf8(),
         QCryptographicHash::Sha1).toHex().left(16);
     const QString dir = StemSeparator::cacheDir() + QLatin1Char('/') + QString::fromLatin1(key);
     const QString base = fi.completeBaseName();
@@ -797,6 +809,132 @@ QJsonObject EditorApi::audioSeparate(const QString& clipId, const QString& keep,
 }
 
 // ---------------------------------------------------------------------------
+// AI upscaling / models
+// ---------------------------------------------------------------------------
+QJsonObject EditorApi::videoUpscale(const QString& clipId, const QString& modelArg, int scale, bool replace,
+                                    bool install, bool force)
+{
+    int ti = -1;
+    const Clip src = requireClip(clipId, &ti);
+    if (m_project->tracks()[ti].isAudio()) throw ApiError(QStringLiteral("Upscaling needs a video clip"));
+    const MediaItem* media = m_project->mediaById(src.mediaId);
+    if (!media || !media->info.hasVideo || media->info.isImage)
+        throw ApiError(QStringLiteral("Upscaling works on video clips (not still images)"));
+    const QString model = modelArg.isEmpty() ? ai::selected(AiTask::Upscale) : modelArg;
+    const AiModel* info = ai::find(model);
+    if (!info || info->task != AiTask::Upscale) {
+        QStringList ids;
+        for (const AiModel& m : ai::models(AiTask::Upscale)) ids << m.id;
+        throw ApiError(QStringLiteral("Unknown upscale model '%1' (use one of: %2)").arg(model, ids.join(QStringLiteral(", "))));
+    }
+    if (scale != 0 && scale != 2 && scale != 4) throw ApiError(QStringLiteral("scale must be 2 or 4"));
+    const AiAssessment fit = ai::assess(*info);
+    const QString rec = ai::recommended(AiTask::Upscale);
+    if (fit.fit == AiFit::Unsupported || (fit.fit == AiFit::TooHeavy && !force))
+        throw ApiError(QStringLiteral("%1 cannot run well on this computer: %2. Recommended here: %3 (model '%4')%5.")
+                           .arg(info->name, fit.reason, ai::find(rec)->name, rec,
+                                fit.fit == AiFit::TooHeavy ? QStringLiteral(", or pass force=true to try anyway") : QString()));
+
+    UpscaleOptions opt = ai::upscaleDefaults(model, media->info.width, media->info.height);
+    if (scale) opt.scale = scale;
+    const QString mediaPath = media->path;
+    const double start = usToSeconds(src.in);
+    const double span = std::max(usToSeconds(src.sourceSpan()), media->info.fps > 0 ? 1.0 / media->info.fps : 0.04);
+    const double duration = std::min(span, std::max(0.0, usToSeconds(media->info.duration) - start));
+
+    struct Done { EditorHost* h; ~Done() { h->progressDone(); } } done{m_host};
+    const auto progress = [this](const QString& t, double f) { return m_host->reportProgress(t, f); };
+    if (!VideoUpscaler::isInstalled(model)) {
+        if (!install)
+            throw ApiError(QStringLiteral("%1 is not installed. Call again with install=true to set it up (one-time "
+                                          "download: about %2 GB of model weights, plus PyTorch ~2.5 GB if needed).")
+                               .arg(info->name).arg(info->downloadGB, 0, 'f', info->downloadGB < 0.1 ? 2 : 1));
+        QString err;
+        if (!VideoUpscaler::install(model, progress, &err)) throw ApiError(QStringLiteral("Setup failed: %1").arg(err));
+    }
+
+    // Cached per source file, range, model and scale.
+    const QFileInfo fi(mediaPath);
+    const QByteArray key = QCryptographicHash::hash(
+        QStringLiteral("%1|%2|%3|%4|%5|%6|%7").arg(fi.absoluteFilePath()).arg(fi.size())
+            .arg(fi.lastModified().toString(Qt::ISODate)).arg(start, 0, 'f', 4).arg(duration, 0, 'f', 4).arg(model).arg(opt.scale).toUtf8(),
+        QCryptographicHash::Sha1).toHex().left(16);
+    const QString dir = VideoUpscaler::cacheDir() + QLatin1Char('/') + QString::fromLatin1(key);
+    const QString out = dir + QLatin1Char('/') + fi.completeBaseName() +
+                        QStringLiteral(" - %1x %2.mp4").arg(opt.scale).arg(model);
+    const bool cached = QFileInfo::exists(out);
+    VideoUpscaler::Result r;
+    if (!cached) {
+        QDir().mkpath(dir);
+        r = VideoUpscaler::upscale(mediaPath, out, start, duration, opt, progress);
+        if (!r.ok) {
+            QFile::remove(out);
+            throw ApiError(r.cancelled ? QStringLiteral("Upscaling cancelled") : QStringLiteral("Upscaling failed: %1").arg(r.error));
+        }
+    }
+
+    // Import (reuse if already in the project).
+    QString newMedia;
+    for (const MediaItem& m : m_project->media())
+        if (QFileInfo(m.path) == QFileInfo(out)) newMedia = m.id;
+    if (newMedia.isEmpty()) {
+        const QJsonArray ok = mediaImport({out}).value("imported").toArray();
+        if (ok.isEmpty()) throw ApiError(QStringLiteral("Could not import %1").arg(out));
+        newMedia = ok.first().toObject().value("id").toString();
+    }
+    QJsonObject res{{"file", out}, {"model", model}, {"scale", opt.scale}, {"cached", cached}, {"mediaId", newMedia}};
+    if (const MediaItem* nm = m_project->mediaById(newMedia)) {
+        res["width"] = nm->info.width;
+        res["height"] = nm->info.height;
+    }
+    if (!cached) {
+        res["device"] = r.device;
+        res["seconds"] = r.seconds;
+    }
+    if (replace) {
+        // Same clip, new source: the upscaled file starts where the clip's source range starts.
+        QString newClip;
+        m_project->edit(QStringLiteral("Upscale clip"), [&] {
+            int at = -1;
+            const Clip orig = *m_project->findClip(clipId, &at);
+            m_project->removeClip(clipId, false);
+            Clip c = orig;
+            c.id = newId();
+            c.mediaId = newMedia;
+            c.in = std::max<TimeUs>(0, orig.in - toUs(start));
+            if (!c.name.contains(QLatin1String("(upscaled"))) c.name += QStringLiteral(" (upscaled %1x)").arg(opt.scale);
+            newClip = m_project->addClip(at, c);
+        });
+        res["clip"] = clipGet(newClip);
+    }
+    return res;
+}
+
+QJsonObject EditorApi::aiModels() const
+{
+    QJsonObject r = ai::toJson();
+    QJsonArray advice;
+    for (const ai::Advice& a : ai::limitedTasks())
+        advice.append(QJsonObject{{"task", ai::taskId(a.task)}, {"best", a.best}, {"bestFit", ai::fitLabel(a.bestFit.fit)},
+                                  {"reason", a.bestFit.reason}, {"recommended", a.recommended}, {"selected", a.selected}});
+    r["limited"] = advice;
+    return r;
+}
+
+QJsonObject EditorApi::aiModelSelect(const QString& taskName, const QString& model)
+{
+    AiTask task;
+    if (!ai::taskFromId(taskName, &task)) throw ApiError(QStringLiteral("task must be upscale, transcribe or separate"));
+    const QString id = model.isEmpty() || model == QLatin1String("recommended") ? ai::recommended(task) : model;
+    const AiModel* info = ai::find(id);
+    if (!info || info->task != task) throw ApiError(QStringLiteral("'%1' is not a %2 model").arg(id, taskName));
+    ai::setSelected(task, id);
+    const AiAssessment a = ai::assess(*info);
+    return {{"task", taskName}, {"selected", id}, {"name", info->name}, {"fit", ai::fitLabel(a.fit)}, {"reason", a.reason},
+            {"installed", ai::isInstalled(id)}, {"recommended", ai::recommended(task)}};
+}
+
+// ---------------------------------------------------------------------------
 // transcripts
 // ---------------------------------------------------------------------------
 namespace {
@@ -804,8 +942,10 @@ QJsonObject lineJson(const TimelineLine& l, int index)
 {
     QJsonArray words;
     for (const auto& w : l.words) words.append(QJsonArray{usToSeconds(w.start), usToSeconds(w.end), w.text});
-    return {{"index", index}, {"clipId", l.clipId}, {"mediaId", l.mediaId}, {"segment", l.segment},
-            {"start", usToSeconds(l.start)}, {"end", usToSeconds(l.end)}, {"text", l.text}, {"words", words}};
+    QJsonObject o{{"index", index}, {"clipId", l.clipId}, {"mediaId", l.mediaId}, {"segment", l.segment},
+                  {"start", usToSeconds(l.start)}, {"end", usToSeconds(l.end)}, {"text", l.text}, {"words", words}};
+    if (l.original != l.text) o["original"] = l.original;
+    return o;
 }
 
 QString srtTime(TimeUs t, QChar sep)
@@ -855,7 +995,8 @@ QJsonObject EditorApi::transcriptCreate(const QString& clipId, const QString& la
     if (!Transcriber::isInstalled()) {
         if (!install)
             throw ApiError(QStringLiteral("Transcription is not installed. Call again with install=true to set it up "
-                                          "(one-time download: Whisper ~5 MB + the turbo model ~1.6 GB)."));
+                                          "(one-time download: Whisper ~5 MB + the %1 model ~%2 GB).")
+                               .arg(Transcriber::model()).arg(Transcriber::downloadGB(), 0, 'f', 1));
         QString err;
         if (!Transcriber::install(progress, &err)) throw ApiError(QStringLiteral("Setup failed: %1").arg(err));
     }
@@ -925,8 +1066,14 @@ QJsonObject EditorApi::transcriptGet(const QString& id) const
         QJsonArray segs;
         for (int i = 0; i < int(t->segments.size()); ++i) {
             const auto& s = t->segments[size_t(i)];
-            segs.append(QJsonObject{{"segment", i}, {"start", toSec(s.start)}, {"end", toSec(s.end)},
-                                    {"text", s.text}, {"edited", s.edited}});
+            QJsonObject so{{"segment", i}, {"start", toSec(s.start)}, {"end", toSec(s.end)},
+                           {"text", s.text}, {"edited", s.edited}};
+            if (!s.translations.isEmpty()) {
+                QJsonObject tr;
+                for (auto it = s.translations.begin(); it != s.translations.end(); ++it) tr[it.key()] = it.value();
+                so["translations"] = tr;
+            }
+            segs.append(so);
         }
         const MediaItem* mi = m_project->mediaById(m);
         transcripts.append(QJsonObject{{"mediaId", m}, {"media", mi ? mi->name : QString()}, {"language", t->language},
@@ -935,6 +1082,7 @@ QJsonObject EditorApi::transcriptGet(const QString& id) const
     if (!mediaId.isEmpty() && transcripts.isEmpty())
         throw ApiError(QStringLiteral("No transcript yet for this media (use transcript_create)"));
     return {{"lines", lines}, {"transcripts", transcripts},
+            {"translations", QJsonArray::fromStringList(m_project->translationLanguages())},
             {"note", "lines: timeline seconds (where it is heard); segments: source seconds of the media"}};
 }
 
@@ -959,6 +1107,22 @@ QJsonObject EditorApi::transcriptUpdate(const QJsonObject& a)
         m_project->removeTranscriptSegment(mediaId, seg);
         return transcriptGet(mediaId);
     }
+    if (a.contains("split")) {        // split at a source time (between words when timed)
+        if (m_project->splitTranscriptSegment(mediaId, seg, toUs(a.value("split").toDouble(-1))) < 0)
+            throw ApiError(QStringLiteral("split must be a source time inside the segment, with words on both sides"));
+        return transcriptGet(mediaId);
+    }
+    if (a.value("merge").toBool()) {  // with the next segment
+        if (!m_project->mergeTranscriptSegments(mediaId, seg)) throw ApiError(QStringLiteral("There is no next segment to merge with"));
+        return transcriptGet(mediaId);
+    }
+    if (a.contains("translation")) {  // {"language": "en", "text": "..."}: edit one translated line
+        const QJsonObject tr = a.value("translation").toObject();
+        const QString lang = tr.value("language").toString();
+        if (lang.isEmpty()) throw ApiError(QStringLiteral("translation needs a language and text"));
+        m_project->setSegmentTranslation(mediaId, seg, lang, tr.value("text").toString());
+        if (!a.contains("text") && !a.contains("start") && !a.contains("end")) return transcriptGet(mediaId);
+    }
     const auto& cur = t->segments[size_t(seg)];
     const QString text = a.contains("text") ? a.value("text").toString() : cur.text;
     const TimeUs s0 = a.contains("start") ? toUs(a.value("start").toDouble()) : -1;
@@ -967,13 +1131,15 @@ QJsonObject EditorApi::transcriptUpdate(const QJsonObject& a)
     return transcriptGet(mediaId);
 }
 
-QJsonObject EditorApi::transcriptExport(const QString& path, const QString& format) const
+QJsonObject EditorApi::transcriptExport(const QString& path, const QString& format, const QString& language) const
 {
     QString fmt = format.toLower();
     if (fmt.isEmpty()) fmt = QFileInfo(path).suffix().toLower();
     if (fmt != QLatin1String("srt") && fmt != QLatin1String("vtt") && fmt != QLatin1String("lrc") && fmt != QLatin1String("txt"))
         throw ApiError(QStringLiteral("format must be srt, vtt, lrc or txt"));
-    const auto lines = m_project->transcriptLines();
+    if (!language.isEmpty() && !m_project->translationLanguages().contains(language))
+        throw ApiError(QStringLiteral("There is no %1 translation (transcript_translate first)").arg(languageName(language)));
+    const auto lines = m_project->transcriptLines(language);
     if (lines.empty()) throw ApiError(QStringLiteral("There is no transcript on the timeline to export"));
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
@@ -992,6 +1158,9 @@ QJsonObject EditorApi::captionsGet() const
         preview.append(QJsonObject{{"start", toSec(chunks[i].start)}, {"end", toSec(chunks[i].end)}, {"text", w.join(' ')}});
     }
     return {{"style", m_project->captionStyle().toJson()}, {"presets", QJsonArray::fromStringList(captionPresetNames())},
+            {"highlightModes", QJsonArray::fromStringList(captionHighlightModes())},
+            {"animations", QJsonArray::fromStringList(captionAnimations())},
+            {"translations", QJsonArray::fromStringList(m_project->translationLanguages())},
             {"suggestedFonts", QJsonArray::fromStringList(CaptionRenderer::suggestedFonts())},
             {"suggestedArabicFonts", QJsonArray::fromStringList(CaptionRenderer::suggestedArabicFonts())},
             {"arabicFontInUse", CaptionRenderer::arabicFamily(m_project->captionStyle())},
@@ -1023,8 +1192,15 @@ QJsonObject EditorApi::captionsSet(const QJsonObject& o)
             throw ApiError(QStringLiteral("'%1' must be one of %2").arg(QLatin1String(k), allowed.join(", ")));
     };
     checkEnum("position", {"bottom", "middle", "top"});
-    checkEnum("animation", {"pop", "fade", "none"});
-    checkEnum("highlightMode", {"color", "box", "none"});
+    checkEnum("animation", captionAnimations());
+    checkEnum("highlightMode", captionHighlightModes());
+    if (o.contains("delay") && !o.value("delay").isDouble()) throw ApiError(QStringLiteral("'delay' must be a number of seconds"));
+    if (o.contains("language") && !o.value("language").toString().isEmpty() &&
+        !m_project->translationLanguages().contains(o.value("language").toString()))
+        throw ApiError(QStringLiteral("There is no %1 translation yet (transcript_translate first); available: %2")
+                           .arg(languageName(o.value("language").toString()),
+                                m_project->translationLanguages().isEmpty() ? QStringLiteral("none")
+                                                                            : m_project->translationLanguages().join(", ")));
     s = CaptionStyle::fromJson(merged);
     if (o.contains("fontFile") && !s.fontFile.isEmpty()) {     // a downloaded font, not installed
         const QString family = CaptionRenderer::loadFontFile(s.fontFile);
@@ -1119,6 +1295,494 @@ QJsonObject EditorApi::clipUpdate(const QString& id, const QJsonObject& o)
     if (o.value("resetTransform").toBool()) c.transform = {};
     m_project->edit(QStringLiteral("Change clip properties"), [&] { m_project->updateClip(c); });
     return clipGet(id);
+}
+
+// ---------------------------------------------------------------------------
+// subtitle timing, import and translation
+// ---------------------------------------------------------------------------
+QJsonObject EditorApi::transcriptShift(const QJsonObject& a)
+{
+    if (!a.value("seconds").isDouble()) throw ApiError(QStringLiteral("'seconds' (number, + = later) is required"));
+    const TimeUs delta = toUs(a.value("seconds").toDouble());
+    const QString mediaId = a.value("mediaId").toString();
+    const int from = a.value("from").toInt(0), to = a.value("to").toInt(-1);
+    QStringList targets;
+    if (!mediaId.isEmpty()) {
+        if (!m_project->transcript(mediaId)) throw ApiError(QStringLiteral("No transcript for media '%1'").arg(mediaId));
+        targets << mediaId;
+    } else {
+        if (a.contains("from") || a.contains("to"))
+            throw ApiError(QStringLiteral("from / to need a mediaId (segment indexes belong to one transcript)"));
+        targets = m_project->transcribedMedia();
+    }
+    if (targets.isEmpty()) throw ApiError(QStringLiteral("There is no transcript to shift"));
+    int shifted = 0;
+    for (const QString& m : targets) shifted += m_project->shiftTranscript(m, delta, from, to) ? 1 : 0;
+    if (!shifted) throw ApiError(QStringLiteral("Nothing was shifted (check from / to)"));
+    QJsonObject r = transcriptGet(mediaId);
+    r["shiftedTranscripts"] = shifted;
+    return r;
+}
+
+namespace {
+double subTime(const QString& s)
+{
+    // [h:]mm:ss(,|.)fff  or  mm:ss.xx (LRC)
+    QString t = s.trimmed();
+    t.replace(QLatin1Char(','), QLatin1Char('.'));
+    const QStringList p = t.split(QLatin1Char(':'));
+    double sec = 0;
+    for (const QString& part : p) sec = sec * 60 + part.toDouble();
+    return sec;
+}
+
+QString cleanSubText(QString t)
+{
+    t.remove(QRegularExpression(QStringLiteral("<[^>]*>")));          // <i>, <font ...>
+    t.remove(QRegularExpression(QStringLiteral("\\{\\\\[^}]*\\}")));   // {\an8}
+    return t.split(QLatin1Char('\n'), Qt::SkipEmptyParts).join(QLatin1Char(' ')).simplified();
+}
+} // namespace
+
+QJsonArray EditorApi::parseSubtitles(const QString& contentIn, const QString& format, QString* error)
+{
+    QJsonArray out;
+    QString content = contentIn;
+    content.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
+    if (content.startsWith(QChar(0xFEFF))) content.remove(0, 1);
+    if (format == QLatin1String("lrc")) {
+        static const QRegularExpression re(QStringLiteral("^\\[(\\d+):(\\d{1,2}(?:[.:]\\d+)?)\\](.*)$"));
+        std::vector<std::pair<double, QString>> rows;
+        for (const QString& line : content.split(QLatin1Char('\n'))) {
+            const auto m = re.match(line.trimmed());
+            if (!m.hasMatch()) continue;
+            QString secPart = m.captured(2);
+            secPart.replace(QLatin1Char(':'), QLatin1Char('.'));
+            rows.emplace_back(m.captured(1).toDouble() * 60 + secPart.toDouble(), m.captured(3).trimmed());
+        }
+        std::sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (rows[i].second.isEmpty()) continue;
+            const double end = i + 1 < rows.size() ? rows[i + 1].first : rows[i].first + 4.0;
+            out.append(QJsonArray{rows[i].first, std::max(end, rows[i].first + 0.2), rows[i].second});
+        }
+    } else {   // srt / vtt
+        static const QRegularExpression cue(QStringLiteral(
+            "((?:\\d+:)?\\d{1,2}:\\d{2}[,.]\\d{1,3})\\s*-->\\s*((?:\\d+:)?\\d{1,2}:\\d{2}[,.]\\d{1,3})"));
+        const QStringList lines = content.split(QLatin1Char('\n'));
+        for (int i = 0; i < lines.size(); ++i) {
+            const auto m = cue.match(lines[i]);
+            if (!m.hasMatch()) continue;
+            QStringList text;
+            int j = i + 1;
+            while (j < lines.size() && !lines[j].trimmed().isEmpty() && !cue.match(lines[j]).hasMatch()) text << lines[j++];
+            const QString t = cleanSubText(text.join(QLatin1Char('\n')));
+            const double s = subTime(m.captured(1)), e = subTime(m.captured(2));
+            if (!t.isEmpty() && e > s) out.append(QJsonArray{s, e, t});
+            i = j - 1;
+        }
+    }
+    if (out.isEmpty() && error) *error = QStringLiteral("No subtitles found in the file");
+    return out;
+}
+
+QJsonObject EditorApi::transcriptImport(const QString& clipId, const QString& path, bool replace)
+{
+    const QString audioId = audioClipFor(clipId);
+    const Clip c = *m_project->findClip(audioId);
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) throw ApiError(QStringLiteral("Cannot read %1: %2").arg(path, f.errorString()));
+    QString fmt = QFileInfo(path).suffix().toLower();
+    if (fmt != QLatin1String("srt") && fmt != QLatin1String("vtt") && fmt != QLatin1String("lrc"))
+        throw ApiError(QStringLiteral("Subtitles must be .srt, .vtt or .lrc"));
+    QString err;
+    const QJsonArray rows = parseSubtitles(QString::fromUtf8(f.readAll()), fmt, &err);
+    if (rows.isEmpty()) throw ApiError(err);
+
+    // Subtitle files are in timeline time; the transcript is in the clip's source time.
+    Transcript t;
+    if (!replace)
+        if (const Transcript* old = m_project->transcript(c.mediaId)) t = *old;
+    t.mediaId = c.mediaId;
+    if (t.model.isEmpty() || replace) t.model = QStringLiteral("imported");
+    int used = 0, skipped = 0;
+    for (const auto& v : rows) {
+        const QJsonArray r = v.toArray();
+        TimeUs a = std::max(c.start, toUs(r[0].toDouble())), b = std::min(c.end(), toUs(r[1].toDouble()));
+        if (b - a < 50'000) {
+            ++skipped;
+            continue;
+        }
+        TimeUs sa = c.sourceTimeAt(a), sb = c.sourceTimeAt(b - 1);
+        if (sb < sa) std::swap(sa, sb);
+        TranscriptSegment seg;
+        seg.start = sa;
+        seg.end = std::max(sb, sa + 1);
+        seg.text = r[2].toString();
+        seg.edited = true;
+        t.segments.push_back(std::move(seg));
+        ++used;
+    }
+    if (!used) throw ApiError(QStringLiteral("None of the %1 subtitles fall inside the clip (%2 s - %3 s on the timeline)")
+                                  .arg(rows.size()).arg(toSec(c.start)).arg(toSec(c.end())));
+    m_project->setTranscript(t);
+    QJsonObject res = transcriptGet(c.mediaId);
+    res["imported"] = used;
+    res["skipped"] = skipped;
+    return res;
+}
+
+QJsonObject EditorApi::transcriptTranslate(const QString& language, const QString& mediaId, bool install, bool showCaptions)
+{
+    if (!Translator::supports(language)) {
+        QStringList codes;
+        for (const auto& [code, name] : subtitleLanguages()) codes << code;
+        throw ApiError(QStringLiteral("Unsupported language '%1' (%2)").arg(language, codes.join(", ")));
+    }
+    QStringList targets;
+    if (!mediaId.isEmpty()) {
+        if (!m_project->transcript(mediaId)) throw ApiError(QStringLiteral("No transcript for media '%1'").arg(mediaId));
+        targets << mediaId;
+    } else {
+        for (const QString& m : m_project->transcribedMedia())
+            if (m_project->isMediaUsed(m)) targets << m;
+    }
+    if (targets.isEmpty()) throw ApiError(QStringLiteral("There is no transcript to translate (transcribe or import subtitles first)"));
+
+    struct Done { EditorHost* h; ~Done() { h->progressDone(); } } done{m_host};
+    const auto progress = [this](const QString& t, double f) { return m_host->reportProgress(t, f); };
+    if (!Translator::isInstalled()) {
+        if (!install)
+            throw ApiError(QStringLiteral("Translation is not installed. Call again with install=true to set it up "
+                                          "(one-time download: the %1 model, about %2 GB).")
+                               .arg(Translator::hfModel()).arg(Translator::downloadGB(), 0, 'f', 1));
+        QString err;
+        if (!Translator::install(progress, &err)) throw ApiError(QStringLiteral("Setup failed: %1").arg(err));
+    }
+    int lines = 0;
+    double seconds = 0;
+    QString device;
+    for (const QString& m : targets) {
+        const Transcript* t = m_project->transcript(m);
+        QStringList texts;
+        for (const auto& s : t->segments) texts << s.text;
+        if (texts.isEmpty()) continue;
+        QString source = t->language;
+        if (!Translator::supports(source)) source.clear();
+        const Translator::Result r = Translator::translate(texts, source, language, progress);
+        if (!r.ok) throw ApiError(r.cancelled ? QStringLiteral("Translation cancelled") : QStringLiteral("Translation failed: %1").arg(r.error));
+        m_project->setTranscriptTranslation(m, language, r.texts);
+        lines += int(texts.size());
+        seconds += r.seconds;
+        device = r.device;
+    }
+    if (showCaptions) {
+        CaptionStyle s = m_project->captionStyle();
+        s.language = language;
+        s.enabled = true;
+        m_project->setCaptionStyle(s);
+    }
+    QJsonArray preview;
+    const auto tl = m_project->transcriptLines(language);
+    for (size_t i = 0; i < std::min<size_t>(tl.size(), 6); ++i)
+        preview.append(QJsonObject{{"start", toSec(tl[i].start)}, {"original", tl[i].original}, {"translation", tl[i].text}});
+    return {{"language", language}, {"languageName", languageName(language)}, {"lines", lines}, {"device", device},
+            {"seconds", seconds}, {"model", Translator::hfModel()}, {"preview", preview},
+            {"captionsLanguage", m_project->captionStyle().language}};
+}
+
+// ---------------------------------------------------------------------------
+// text overlays
+// ---------------------------------------------------------------------------
+TextData EditorApi::textDataFrom(const QJsonObject& a, const TextData& base) const
+{
+    TextData d = base;
+    if (a.contains("text")) {
+        if (!a.value("text").isString()) throw ApiError(QStringLiteral("'text' must be a string"));
+        d.text = a.value("text").toString();
+    }
+    const QJsonObject st = a.value("style").toObject();
+    for (const char* k : {"color", "color2", "outline", "shadowColor", "backgroundColor"})
+        if (st.contains(QLatin1String(k)) && !QColor(st.value(QLatin1String(k)).toString()).isValid())
+            throw ApiError(QStringLiteral("style.%1 must be a color like #FFD400 or #80000000").arg(QLatin1String(k)));
+    const auto checkEnum = [](const QJsonObject& o, const char* k, const QStringList& allowed, const char* where) {
+        if (o.contains(QLatin1String(k)) && !allowed.contains(o.value(QLatin1String(k)).toString()))
+            throw ApiError(QStringLiteral("%1.%2 must be one of %3").arg(QLatin1String(where), QLatin1String(k), allowed.join(", ")));
+    };
+    checkEnum(st, "align", {"left", "center", "right"}, "style");
+    checkEnum(st, "backgroundMode", {"block", "lines"}, "style");
+    TextStyle s = TextStyle::fromJson(st, d.style);
+    if (st.contains("fontFile") && !s.fontFile.isEmpty()) {
+        const QString family = CaptionRenderer::loadFontFile(s.fontFile);
+        if (family.isEmpty()) throw ApiError(QStringLiteral("'%1' is not a font file (.ttf / .otf)").arg(s.fontFile));
+        if (!st.contains("font")) s.font = family;
+    } else if (st.contains("font")) {
+        s.fontFile.clear();
+        if (!QFontDatabase::families().contains(s.font, Qt::CaseInsensitive))
+            throw ApiError(QStringLiteral("Font '%1' is not installed (use any installed font, or style.fontFile for a "
+                                          ".ttf / .otf file)").arg(s.font));
+    }
+    d.style = s;
+    const QJsonObject an = a.value("animation").toObject();
+    checkEnum(an, "in", textAnimationsIn(), "animation");
+    checkEnum(an, "out", textAnimationsOut(), "animation");
+    checkEnum(an, "loop", textAnimationsLoop(), "animation");
+    d.animation = TextAnimation::fromJson(an, d.animation);
+    return d;
+}
+
+QJsonObject EditorApi::textTemplates() const
+{
+    QJsonArray list;
+    for (const TextTemplate& t : textTemplates::all()) {
+        QJsonObject o = t.toJson();
+        o.remove("text");
+        o["defaultText"] = t.data.text;
+        o["style"] = t.data.style.toJson();
+        o["animation"] = t.data.animation.toJson();
+        list.append(o);
+    }
+    return {{"templates", list},
+            {"animations", QJsonObject{{"in", QJsonArray::fromStringList(textAnimationsIn())},
+                                       {"out", QJsonArray::fromStringList(textAnimationsOut())},
+                                       {"loop", QJsonArray::fromStringList(textAnimationsLoop())}}},
+            {"suggestedFonts", QJsonArray::fromStringList(CaptionRenderer::suggestedFonts())},
+            {"note", "Positions x / y are fractions of the canvas (offset from the centre, + = right / down). Sizes are "
+                     "fractions of the canvas height; outline, shadow and padding are fractions of the font size."}};
+}
+
+QJsonObject EditorApi::textAdd(const QJsonObject& a)
+{
+    TextData d;
+    const int cw = m_project->settings().width, ch = m_project->settings().height;
+    ClipTransform tr;
+    double duration = 4.0;
+    if (a.contains("template")) {
+        const auto tpl = textTemplates::find(a.value("template").toString());
+        if (!tpl) throw ApiError(QStringLiteral("Unknown template '%1' (see text_templates)").arg(a.value("template").toString()));
+        d = tpl->data;
+        tr = tpl->transform(cw, ch);
+        duration = tpl->duration;
+    } else {
+        d.text = QString();
+    }
+    d = textDataFrom(a, d);
+    if (d.text.trimmed().isEmpty()) throw ApiError(QStringLiteral("'text' is required (or a template with default words)"));
+    const QJsonObject t = a.value("transform").toObject();
+    tr.x = clampNum(t, "x", tr.x, -16384, 16384);
+    tr.y = clampNum(t, "y", tr.y, -16384, 16384);
+    tr.scale = clampNum(t, "scale", tr.scale, 0.01, 20);
+    tr.rotation = clampNum(t, "rotation", tr.rotation, -3600, 3600);
+    tr.opacity = clampNum(t, "opacity", tr.opacity, 0, 1);
+    duration = clampNum(a, "duration", duration, 0.1, 36000);
+    const TimeUs start = a.contains("start") ? toUs(clampNum(a, "start", 0, 0, 1e7)) : m_host->playhead();
+    int track = -1;
+    if (a.contains("track")) {
+        track = requireTrack(a.value("track").toInt(-1));
+        if (m_project->tracks()[track].isAudio()) throw ApiError(QStringLiteral("Text goes on a video track"));
+    }
+    QString id;
+    m_project->edit(QStringLiteral("Add text"), [&] { id = m_project->addTextClip(track, start, toUs(duration), d, tr); });
+    if (id.isEmpty()) throw ApiError(QStringLiteral("Could not add the text"));
+    return clipGet(id);
+}
+
+QJsonObject EditorApi::textUpdate(const QString& clipId, const QJsonObject& a)
+{
+    Clip c = requireClip(clipId);
+    if (!c.isText()) throw ApiError(QStringLiteral("Clip %1 is not a text clip").arg(clipId));
+    TextData d = *c.text;
+    if (a.contains("template")) {
+        const auto tpl = textTemplates::find(a.value("template").toString());
+        if (!tpl) throw ApiError(QStringLiteral("Unknown template '%1' (see text_templates)").arg(a.value("template").toString()));
+        const QString words = d.text;
+        d = tpl->data;
+        d.text = words;
+    }
+    d = textDataFrom(a, d);
+    if (d.text.trimmed().isEmpty()) throw ApiError(QStringLiteral("The text cannot be empty (remove the clip instead)"));
+    c.text = d;
+    const QString first = d.text.section(QChar(u'\n'), 0, 0).trimmed();
+    c.name = first.left(60);
+    m_project->edit(QStringLiteral("Edit text"), [&] { m_project->updateClip(c); });
+    return clipGet(clipId);
+}
+
+QJsonObject EditorApi::textTemplateSave(const QString& clipId, const QString& name)
+{
+    const Clip& c = requireClip(clipId);
+    if (!c.isText()) throw ApiError(QStringLiteral("Clip %1 is not a text clip").arg(clipId));
+    if (name.trimmed().isEmpty()) throw ApiError(QStringLiteral("'name' is required"));
+    const double w = m_project->settings().width, h = m_project->settings().height;
+    const QString id = textTemplates::saveCustom(name, *c.text, c.transform.x / w, c.transform.y / h, c.transform.rotation,
+                                                 toSec(c.duration));
+    return {{"id", id}, {"name", name.trimmed()}, {"customTemplates", int(textTemplates::custom().size())}};
+}
+
+QJsonObject EditorApi::textTemplateDelete(const QString& id)
+{
+    if (!textTemplates::removeCustom(id))
+        throw ApiError(QStringLiteral("No custom template '%1' (built-in templates cannot be deleted)").arg(id));
+    return {{"deleted", id}, {"customTemplates", int(textTemplates::custom().size())}};
+}
+
+// ---------------------------------------------------------------------------
+// text to speech
+// ---------------------------------------------------------------------------
+QJsonObject EditorApi::ttsVoices(const QString& engine) const
+{
+    if (!engine.isEmpty() && !TextToSpeech::engines().contains(engine))
+        throw ApiError(QStringLiteral("engine must be one of %1").arg(TextToSpeech::engines().join(", ")));
+    QJsonArray engines;
+    for (const QString& e : TextToSpeech::engines()) {
+        if (!engine.isEmpty() && e != engine) continue;
+        QJsonArray voices;
+        for (const auto& v : TextToSpeech::voices(e))
+            voices.append(QJsonObject{{"id", v.id}, {"name", v.name}, {"language", v.language}, {"gender", v.gender},
+                                      {"installed", v.installed}, {"downloadMB", v.downloadMB}});
+        engines.append(QJsonObject{{"engine", e}, {"name", TextToSpeech::engineName(e)},
+                                   {"available", TextToSpeech::engineAvailable(e)}, {"installed", TextToSpeech::isInstalled(e)},
+                                   {"online", TextToSpeech::isOnline(e)}, {"voices", voices}});
+    }
+    return {{"engines", engines},
+            {"note", "system and piper run on this computer; edge sends the text to Microsoft's online service."}};
+}
+
+QString EditorApi::speechMedia(const QString& text, const QString& engine, const QString& voiceIn, double rate, bool install,
+                               bool* cached)
+{
+    if (!TextToSpeech::engines().contains(engine))
+        throw ApiError(QStringLiteral("engine must be one of %1").arg(TextToSpeech::engines().join(", ")));
+    if (!TextToSpeech::engineAvailable(engine)) throw ApiError(QStringLiteral("%1 is not available on this computer").arg(TextToSpeech::engineName(engine)));
+    QString voice = voiceIn;
+    if (voice.isEmpty()) voice = TextToSpeech::defaultVoice(engine, {});
+    const auto progress = [this](const QString& t, double f) { return m_host->reportProgress(t, f); };
+    if (!TextToSpeech::isInstalled(engine, engine == QLatin1String("piper") ? voice : QString())) {
+        if (!install)
+            throw ApiError(QStringLiteral("%1 is not set up yet. Call again with install=true (one-time download%2).")
+                               .arg(TextToSpeech::engineName(engine),
+                                    engine == QLatin1String("piper") ? QStringLiteral(": Piper ~25 MB + the voice ~60 MB") : QString()));
+        QString err;
+        if (!TextToSpeech::install(engine, voice, progress, &err)) throw ApiError(QStringLiteral("Setup failed: %1").arg(err));
+    }
+    const TextToSpeech::Result r = TextToSpeech::synthesize(text, engine, voice, rate, progress);
+    if (!r.ok) throw ApiError(r.cancelled ? QStringLiteral("Speech cancelled") : QStringLiteral("Speech failed: %1").arg(r.error));
+    if (cached) *cached = r.cached;
+    const QString abs = QFileInfo(r.path).absoluteFilePath();
+    for (const auto& m : m_project->media())
+        if (QFileInfo(m.path).absoluteFilePath() == abs) return m.id;
+    QString err;
+    const auto info = MediaProbe::probe(abs, &err);
+    if (!info) throw ApiError(QStringLiteral("Could not read the speech audio: %1").arg(err));
+    MediaItem item;
+    item.path = abs;
+    item.name = QStringLiteral("Voice: ") + text.simplified().left(40);
+    item.info = *info;
+    const QString id = m_project->addMedia(std::move(item));
+    return id;
+}
+
+namespace {
+QString defaultEngine()
+{
+    const QString saved = QSettings().value(QStringLiteral("tts/engine")).toString();
+    if (TextToSpeech::engines().contains(saved) && TextToSpeech::engineAvailable(saved)) return saved;
+    return TextToSpeech::engineAvailable(QStringLiteral("system")) ? QStringLiteral("system") : QStringLiteral("piper");
+}
+} // namespace
+
+QJsonObject EditorApi::ttsSpeak(const QJsonObject& a)
+{
+    QString text = a.value("text").toString();
+    TimeUs start = a.contains("start") ? toUs(clampNum(a, "start", 0, 0, 1e7)) : m_host->playhead();
+    if (a.contains("clipId")) {
+        const Clip& c = requireClip(a.value("clipId").toString());
+        if (!c.isText()) throw ApiError(QStringLiteral("clipId must be a text clip (or pass text)"));
+        if (text.isEmpty()) text = c.text->text;
+        if (!a.contains("start")) start = c.start;
+    }
+    if (text.trimmed().isEmpty()) throw ApiError(QStringLiteral("'text' (or a text clip's clipId) is required"));
+    const QString engine = a.value("engine").toString(defaultEngine());
+    QString voice = a.value("voice").toString();
+    if (voice.isEmpty() && a.contains("language")) voice = TextToSpeech::defaultVoice(engine, a.value("language").toString());
+    const double rate = clampNum(a, "rate", 1.0, 0.5, 2.0);
+    int track = -1;
+    if (a.contains("track")) {
+        track = requireTrack(a.value("track").toInt(-1));
+        if (!m_project->tracks()[track].isAudio()) throw ApiError(QStringLiteral("Speech goes on an audio track"));
+    }
+    struct Done { EditorHost* h; ~Done() { h->progressDone(); } } done{m_host};
+    bool cached = false;
+    const QString mediaId = speechMedia(text, engine, voice, rate, a.value("install").toBool(), &cached);
+    QString id;
+    m_project->edit(QStringLiteral("Add voice-over"), [&] { id = m_project->addMediaClips(mediaId, -1, track, start, nullptr, false); });
+    if (id.isEmpty()) throw ApiError(QStringLiteral("Could not add the speech clip"));
+    QJsonObject r = clipGet(id);
+    r["engine"] = engine;
+    r["voice"] = voice.isEmpty() ? TextToSpeech::defaultVoice(engine, {}) : voice;
+    r["cached"] = cached;
+    return r;
+}
+
+QJsonObject EditorApi::ttsSubtitles(const QJsonObject& a)
+{
+    const QString language = a.value("language").toString();
+    const auto lines = m_project->transcriptLines(language);
+    if (lines.empty()) throw ApiError(QStringLiteral("There are no subtitles on the timeline (transcribe or import first)"));
+    const QString engine = a.value("engine").toString(defaultEngine());
+    QString voice = a.value("voice").toString();
+    if (voice.isEmpty()) {
+        QString lang = language;
+        if (lang.isEmpty())
+            if (const Transcript* t = m_project->transcript(lines.front().mediaId)) lang = t->language;
+        voice = TextToSpeech::defaultVoice(engine, lang);
+    }
+    const double rate = clampNum(a, "rate", 1.0, 0.5, 2.0);
+    const bool install = a.value("install").toBool();
+    struct Done { EditorHost* h; ~Done() { h->progressDone(); } } done{m_host};
+    std::vector<std::pair<QString, TimeUs>> clips;   // media id, timeline start
+    int cachedCount = 0;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (!m_host->reportProgress(QStringLiteral("Voice-over line %1 of %2...").arg(i + 1).arg(lines.size()),
+                                    double(i) / double(lines.size())))
+            throw ApiError(QStringLiteral("Cancelled"));
+        bool cached = false;
+        clips.emplace_back(speechMedia(lines[i].text, engine, voice, rate, install, &cached), lines[i].start);
+        cachedCount += cached ? 1 : 0;
+    }
+    const bool hasVolume = a.contains("originalVolume");
+    const double origVol = clampNum(a, "originalVolume", 1.0, 0.0, 4.0);
+    QStringList added;
+    m_project->edit(QStringLiteral("Add subtitle voice-over"), [&] {
+        int main = m_project->addTrack(QStringLiteral("Voice-over"), TrackKind::Audio);
+        int overflow = -1;
+        for (const auto& [media, start] : clips) {
+            const MediaItem* m = m_project->mediaById(media);
+            const TimeUs end = start + (m ? m->info.duration : kUsPerSecond);
+            int t = main;
+            if (!m_project->isTrackFree(t, start, end)) {   // a long line runs into the next one
+                if (overflow < 0) overflow = m_project->addTrack(QStringLiteral("Voice-over 2"), TrackKind::Audio);
+                t = overflow;
+            }
+            const QString id = m_project->addMediaClips(media, -1, t, start, nullptr, false);
+            if (!id.isEmpty()) added << id;
+        }
+        if (hasVolume) {   // turn the original speech down under the voice-over
+            QStringList done;
+            for (const auto& l : lines) {
+                if (done.contains(l.clipId)) continue;
+                done << l.clipId;
+                if (const Clip* c = m_project->findClip(l.clipId)) {
+                    Clip copy = *c;
+                    copy.volume = origVol;
+                    m_project->updateClip(copy);
+                }
+            }
+        }
+    });
+    QJsonArray ids = QJsonArray::fromStringList(added);
+    return {{"clips", ids}, {"lines", int(lines.size())}, {"engine", engine}, {"voice", voice}, {"cached", cachedCount},
+            {"language", language}};
 }
 
 // ---------------------------------------------------------------------------

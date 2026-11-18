@@ -122,7 +122,7 @@ def main():
     tools = client.request("tools/list")["result"]["tools"]
     names = {t["name"] for t in tools}
     print(f"  {len(tools)} tools")
-    check(len(tools) == 56, "56 tools advertised")
+    check(len(tools) == 70, f"70 tools advertised ({len(tools)})")
     check(all(t["inputSchema"]["type"] == "object" and "description" in t and "annotations" in t for t in tools),
           "every tool has a schema, description and annotations")
     unknown = client.request("tools/call", {"name": "does_not_exist", "arguments": {}})
@@ -299,6 +299,20 @@ def main():
     # (never triggers the one-time install).
     call("audio_separate", {"clipId": tone["id"], "keep": "drums"}, expect_error=True)
     call("audio_separate", {"clipId": "nope"}, expect_error=True)
+    # Local AI models: hardware profile + recommendations. Upscaling: argument checks only
+    # (never installs or runs a model here).
+    am, _ = call("ai_models")
+    check(am["hardware"]["ramGB"] > 0 and {t["task"] for t in am["tasks"]} == {"upscale", "transcribe", "separate", "translate"},
+          "ai_models: hardware and the four tasks")
+    up_task = next(t for t in am["tasks"] if t["task"] == "upscale")
+    check(any(m["recommended"] for m in up_task["models"]) and up_task["recommended"] in {m["id"] for m in up_task["models"]},
+          "ai_models: one recommended upscale model")
+    # ai_model_select saves to the user's settings: only invalid choices here.
+    call("ai_model_select", {"task": "upscale", "model": "whisper-base"}, expect_error=True)
+    call("ai_model_select", {"task": "paint", "model": "recommended"}, expect_error=True)
+    call("video_upscale", {"clipId": a["id"], "model": "realesrgan-general", "scale": 3}, expect_error=True)
+    call("video_upscale", {"clipId": a["id"], "model": "nope"}, expect_error=True)
+    call("video_upscale", {"clipId": tone["id"]}, expect_error=True)   # audio clip
     # Transcripts: transcription itself is tested in separation_test.py; here the editing tools.
     call("transcript_create", {"clipId": "nope"}, expect_error=True)
     tg, _ = call("transcript_get")
@@ -441,6 +455,145 @@ def main():
     call("export_video", {"path": os.path.join(out, "x.mp4"), "encoder": "no_such_encoder"}, expect_error=True)
     pr, _ = call("media_probe", {"path": ex["path"]})
     check(pr["width"] == 640 and pr["hasAudio"] and abs(pr["duration"] - 3) < 0.2, "exported file is valid")
+
+    print("== text overlays")
+    tt, _ = call("text_templates")
+    tpl_ids = {t["id"] for t in tt["templates"]}
+    check(len(tt["templates"]) >= 12 and {"title", "lower-third", "typewriter", "neon"} <= tpl_ids and
+          "typewriter" in tt["animations"]["in"] and "pulse" in tt["animations"]["loop"], "text_templates")
+    base_layers = call("render_frame", {"time": 1.5})[0]["layers"]
+    base_start = call("render_frame", {"time": 0.5})[0]["layers"]
+    tx, _ = call("text_add", {"template": "lower-third", "text": "Mark\nEditor", "start": 0.5, "duration": 2})
+    check(tx["kind"] == "text" and tx["text"]["text"] == "Mark\nEditor" and tx["trackKind"] == "video" and
+          tx["text"]["animation"]["in"] == "slide-right" and abs(tx["duration"] - 2) < 0.01, "text_add from a template")
+    check(call("render_frame", {"time": 1.5, "path": os.path.join(out, "text_frame.png")})[0]["layers"] == base_layers + 1,
+          "text drawn as a layer")
+    check(call("render_frame", {"time": 0.5})[0]["layers"] == base_start,
+          "text not drawn yet on its first frame (it slides in)")
+    tu2, _ = call("text_update", {"clipId": tx["id"], "text": "Hello", "style": {"color": "#FF0000", "outlineWidth": 0.1,
+                                                                               "shadow": True, "align": "right"},
+                                   "animation": {"in": "typewriter", "inDuration": 1.0, "loop": "pulse"}})
+    st = tu2["text"]["style"]
+    check(tu2["text"]["text"] == "Hello" and st["color"].lower() == "#ffff0000" and st["shadow"] and st["align"] == "right" and
+          tu2["text"]["animation"]["in"] == "typewriter" and tu2["text"]["animation"]["loop"] == "pulse" and
+          st["background"], "text_update (partial: keeps the template's background)")
+    tn, _ = call("text_update", {"clipId": tx["id"], "template": "neon"})
+    check(tn["text"]["text"] == "Hello" and tn["text"]["templateId"] == "neon", "text_update re-styles from a template")
+    call("edit_undo")
+    check(call("clip_get", {"clipId": tx["id"]})[0]["text"]["templateId"] == "lower-third", "text edits are undoable")
+    call("text_update", {"clipId": tx["id"], "animation": {"in": "explode"}}, expect_error=True)
+    call("text_update", {"clipId": tx["id"], "style": {"color": "nope"}}, expect_error=True)
+    call("text_update", {"clipId": tx["id"], "style": {"font": "No Such Font 123"}}, expect_error=True)
+    call("text_update", {"clipId": tone["id"], "text": "x"}, expect_error=True)   # not a text clip
+    call("text_add", {"template": "no-such-template"}, expect_error=True)
+    call("text_add", {"text": "  "}, expect_error=True)
+    call("text_add", {"text": "x", "track": 3}, expect_error=True)                # audio track
+    call("clip_set_speed", {"clipId": tx["id"], "speed": 2}, expect_error=True)
+    ar, _ = call("text_add", {"text": "مرحبا بكم", "start": 3, "duration": 1.5, "style": {"size": 0.1},
+                              "transform": {"y": 200, "rotation": -5}})
+    check(ar["transform"]["y"] == 200 and ar["text"]["style"]["size"] == 0.1, "text_add Arabic with transform")
+    call("render_frame", {"time": 3.8, "path": os.path.join(out, "text_arabic.png")})
+    ts, _ = call("text_template_save", {"clipId": ar["id"], "name": "E2E Test Template"})
+    check(ts["id"] == "custom-e2e-test-template", "text_template_save")
+    check(ts["id"] in {t["id"] for t in call("text_templates")[0]["templates"]}, "saved template listed")
+    fromc, _ = call("text_add", {"template": ts["id"], "start": 5})
+    check(fromc["text"]["text"] == "مرحبا بكم" and fromc["transform"]["y"] == 200, "text_add from a custom template")
+    call("text_template_delete", {"id": ts["id"]})
+    call("text_template_delete", {"id": ts["id"]}, expect_error=True)
+    call("text_template_delete", {"id": "title"}, expect_error=True)              # built-in
+    sj2, _ = call("project_save", {"path": os.path.join(out, "text_project.veproj")})
+    call("project_open", {"path": os.path.join(out, "text_project.veproj")})
+    rt = call("clip_get", {"clipId": tx["id"]})[0]
+    check(rt["kind"] == "text" and rt["text"]["text"] == "Hello" and rt["text"]["style"]["shadow"], "text survives save/open")
+
+    print("== subtitles: timing, import, translation")
+    mid = ids["tone.mp3"]
+    call("transcript_update", {"mediaId": mid, "insert": {"start": 0.5, "end": 2.0, "text": "hello there my friend"}})
+    tg, _ = call("transcript_update", {"mediaId": mid, "insert": {"start": 2.5, "end": 3.5, "text": "second line"}})
+    segs0 = tg["transcripts"][0]["segments"]
+    check(len(segs0) == 2, "two subtitle lines")
+    sh, _ = call("transcript_shift", {"seconds": 0.25})
+    segs = sh["transcripts"][0]["segments"]
+    check(abs(segs[0]["start"] - 0.75) < 1e-3 and abs(segs[1]["start"] - 2.75) < 1e-3, "transcript_shift every line")
+    sh, _ = call("transcript_shift", {"seconds": -0.25, "mediaId": mid, "from": 1})
+    segs = sh["transcripts"][0]["segments"]
+    check(abs(segs[0]["start"] - 0.75) < 1e-3 and abs(segs[1]["start"] - 2.5) < 1e-3, "transcript_shift from a line")
+    call("transcript_shift", {"seconds": 1, "from": 1}, expect_error=True)
+    call("transcript_shift", {"seconds": "x"}, expect_error=True)
+    sp, _ = call("transcript_update", {"mediaId": mid, "segment": 0, "split": 1.5})
+    segs = sp["transcripts"][0]["segments"]
+    check(len(segs) == 3 and segs[0]["text"] == "hello there" and segs[1]["text"] == "my friend", "split a line")
+    mg, _ = call("transcript_update", {"mediaId": mid, "segment": 0, "merge": True})
+    check(len(mg["transcripts"][0]["segments"]) == 2 and mg["transcripts"][0]["segments"][0]["text"] == "hello there my friend",
+          "merge lines")
+    call("transcript_update", {"mediaId": mid, "segment": 0, "split": 99}, expect_error=True)
+    exs, _ = call("transcript_export", {"path": os.path.join(out, "subs.srt")})
+    before = [(l["start"], l["text"]) for l in call("transcript_get")[0]["lines"]]
+    im, _ = call("transcript_import", {"clipId": tone["id"], "path": os.path.join(out, "subs.srt")})
+    after = [(l["start"], l["text"]) for l in im["lines"]]
+    check(im["imported"] == 2 and [t for _, t in after] == [t for _, t in before] and
+          all(abs(a[0] - b[0]) < 0.01 for a, b in zip(after, before)), "transcript_import round-trips an SRT")
+    with open(os.path.join(out, "subs.vtt"), "w", encoding="utf-8") as f:
+        f.write("WEBVTT\n\n00:01.000 --> 00:02.500\n<i>first</i> cue\n\n00:03.000 --> 00:04.000\nsecond cue\n")
+    imv, _ = call("transcript_import", {"clipId": tone["id"], "path": os.path.join(out, "subs.vtt"), "replace": False})
+    check(imv["imported"] == 2 and len(imv["transcripts"][0]["segments"]) == 4 and
+          "first cue" in [s["text"] for s in imv["transcripts"][0]["segments"]], "transcript_import VTT (added, tags removed)")
+    call("transcript_import", {"clipId": tone["id"], "path": os.path.join(data, "tone.mp3")}, expect_error=True)
+    call("transcript_import", {"clipId": tone["id"], "path": os.path.join(out, "subs.srt"), "replace": True})
+    tr1, _ = call("transcript_update", {"mediaId": mid, "segment": 0, "translation": {"language": "fr", "text": "bonjour mon ami"}})
+    check(tr1["translations"] == ["fr"] and tr1["transcripts"][0]["segments"][0]["translations"]["fr"] == "bonjour mon ami",
+          "translation of one line")
+    call("captions_set", {"language": "de"}, expect_error=True)   # no German translation
+    cg0, _ = call("captions_set", {"enabled": True, "preset": "classic", "language": ""})
+    first0 = cg0["firstCaptions"][0]["start"]
+    cgk, _ = call("captions_set", {"highlightMode": "karaoke", "animation": "reveal", "delay": 0.5})
+    check(abs(cgk["firstCaptions"][0]["start"] - first0 - 0.5) < 1e-3 and "karaoke" in cgk["highlightModes"],
+          "captions delay / karaoke / reveal")
+    call("render_frame", {"time": first0 + 0.9, "path": os.path.join(out, "caption_karaoke.png")})
+    cgb, _ = call("captions_set", {"language": "fr", "bilingual": True, "delay": 0, "preset": "sweep"})
+    check(cgb["style"]["language"] == "fr" and cgb["style"]["bilingual"] and cgb["firstCaptions"][0]["text"] == "bonjour mon ami",
+          "captions show the translation (bilingual)")
+    rfb, _ = call("render_frame", {"time": first0 + 0.3, "path": os.path.join(out, "caption_bilingual.png")})
+    check(rfb["layers"] >= 1, "bilingual caption rendered")
+    call("captions_set", {"animation": "spin"}, expect_error=True)
+    call("captions_set", {"highlightMode": "rainbow"}, expect_error=True)
+    exf, _ = call("transcript_export", {"path": os.path.join(out, "subs_fr.srt"), "language": "fr"})
+    check("bonjour mon ami" in open(os.path.join(out, "subs_fr.srt"), encoding="utf-8").read(), "transcript_export a translation")
+    call("transcript_export", {"path": os.path.join(out, "subs_de.srt"), "language": "de"}, expect_error=True)
+    call("transcript_translate", {"language": "klingon"}, expect_error=True)
+    tr_task = next(t for t in am["tasks"] if t["task"] == "translate")
+    tr_ready = any(m["installed"] and m["id"] == tr_task["selected"] for m in tr_task["models"])
+    if tr_ready:
+        tt2, _ = call("transcript_translate", {"language": "es", "mediaId": mid})
+        check(tt2["lines"] == 2 and all(p["translation"] for p in tt2["preview"]) and tt2["captionsLanguage"] == "es",
+              f"transcript_translate (NLLB on {tt2['device']}): {[p['translation'] for p in tt2['preview']]}")
+    else:
+        call("transcript_translate", {"language": "es"}, expect_error=True)    # not installed, no install=true
+    call("captions_set", {"enabled": False, "language": "", "bilingual": False})
+
+    print("== text to speech")
+    tv, _ = call("tts_voices")
+    engines = {e["engine"]: e for e in tv["engines"]}
+    check(set(engines) == {"system", "piper", "edge"} and engines["edge"]["online"] and
+          any(v["id"] == "ar-EG-SalmaNeural" for v in engines["edge"]["voices"]), "tts_voices")
+    call("tts_voices", {"engine": "nope"}, expect_error=True)
+    call("tts_speak", {"text": "   ", "engine": "system"}, expect_error=True)
+    call("tts_speak", {"text": "hi", "engine": "nope"}, expect_error=True)
+    if engines["system"]["available"] and engines["system"]["voices"]:
+        sp1, _ = call("tts_speak", {"text": "Hello from the video editor.", "engine": "system", "start": 1, "rate": 1.2})
+        check(sp1["trackKind"] == "audio" and sp1["duration"] > 0.5 and abs(sp1["start"] - 1) < 0.05, "tts_speak (Windows voice)")
+        sp2, _ = call("tts_speak", {"text": "Hello from the video editor.", "engine": "system", "start": 4, "rate": 1.2})
+        check(sp2["cached"] and sp2["mediaId"] == sp1["mediaId"], "tts_speak reuses the cached speech")
+        sp3, _ = call("tts_speak", {"clipId": tx["id"], "engine": "system"})
+        check(abs(sp3["start"] - 0.5) < 0.05, "tts_speak reads a text clip at its start")
+        call("tts_speak", {"text": "x", "engine": "system", "track": 0}, expect_error=True)   # video track
+        ts2, _ = call("tts_subtitles", {"engine": "system", "originalVolume": 0.3})
+        tracks = call("track_list")[0]["tracks"]
+        check(len(ts2["clips"]) == ts2["lines"] == 2 and any(t["name"] == "Voice-over" for t in tracks) and
+              call("clip_get", {"clipId": tone["id"]})[0]["volume"] == 0.3, "tts_subtitles (voice-over, original turned down)")
+    else:
+        call("tts_speak", {"text": "hi", "engine": "system"}, expect_error=True)
+        call("tts_subtitles", {"engine": "system"}, expect_error=True)
 
     missing = names - called
     check(not missing, "every advertised tool was exercised" + (f" (missing: {sorted(missing)})" if missing else ""))

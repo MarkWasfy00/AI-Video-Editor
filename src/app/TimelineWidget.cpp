@@ -26,22 +26,23 @@ constexpr int kSnapPx = 8;
 constexpr double kMinPxPerSec = 2.0;
 constexpr double kMaxPxPerSec = 2000.0;
 
-const QColor kBg(30, 30, 34);
-const QColor kTrackA(38, 38, 43);
-const QColor kTrackB(43, 43, 49);
-const QColor kHeaderBg(50, 50, 57);
-const QColor kRulerBg(46, 46, 52);
-const QColor kPlayhead(235, 70, 70);
+const QColor kBg(8, 8, 10);
+const QColor kTrackA(17, 17, 19);
+const QColor kTrackB(20, 20, 23);
+const QColor kHeaderBg(24, 24, 27);
+const QColor kRulerBg(18, 18, 20);
+const QColor kPlayhead(255, 77, 77);
+const QColor kGridLine(6, 6, 7);
 
-const QColor kVideoTag(70, 120, 200);
-const QColor kAudioTag(60, 160, 105);
+const QColor kVideoTag(76, 141, 255);
+const QColor kAudioTag(52, 168, 120);
 
 QColor clipColor(const MediaItem* m, bool audioTrack)
 {
-    if (!m) return QColor(110, 110, 110);
-    if (audioTrack) return QColor(46, 128, 84);
-    if (m->info.isImage) return QColor(138, 92, 184);
-    return QColor(61, 111, 182);
+    if (!m) return QColor(70, 70, 76);
+    if (audioTrack) return QColor(30, 104, 76);
+    if (m->info.isImage) return QColor(104, 72, 150);
+    return QColor(44, 84, 150);
 }
 } // namespace
 
@@ -264,8 +265,8 @@ void TimelineWidget::paintEvent(QPaintEvent*)
     paintHeaders(p);
 
     // Corner
-    p.fillRect(QRect(0, 0, kHeaderW, kRulerH), kHeaderBg.darker(115));
-    p.setPen(QColor(220, 220, 220));
+    p.fillRect(QRect(0, 0, kHeaderW, kRulerH), kRulerBg);
+    p.setPen(QColor(228, 228, 231));
     p.drawText(QRect(6, 0, kHeaderW - 6, kRulerH), Qt::AlignVCenter | Qt::AlignLeft,
                formatTimecode(m_playhead, m_project->settings().fps));
 
@@ -289,9 +290,9 @@ void TimelineWidget::paintEvent(QPaintEvent*)
         const double x1 = m_markOut >= 0 ? xForTime(m_markOut) : viewport()->width();
         p.save();
         p.setClipRect(QRect(kHeaderW, 0, viewport()->width() - kHeaderW, viewport()->height()));
-        p.fillRect(QRectF(x0, 0, x1 - x0, viewport()->height()), QColor(90, 160, 255, 38));
-        p.fillRect(QRectF(x0, 0, x1 - x0, 5), QColor(90, 160, 255, 200));
-        p.setPen(QPen(QColor(90, 160, 255), 1.5));
+        p.fillRect(QRectF(x0, 0, x1 - x0, viewport()->height()), QColor(76, 141, 255, 34));
+        p.fillRect(QRectF(x0, 0, x1 - x0, 5), QColor(76, 141, 255, 210));
+        p.setPen(QPen(QColor(76, 141, 255), 1.5));
         if (m_markIn >= 0) p.drawLine(QPointF(x0, 0), QPointF(x0, viewport()->height()));
         if (m_markOut >= 0) p.drawLine(QPointF(x1, 0), QPointF(x1, viewport()->height()));
         p.restore();
@@ -318,7 +319,7 @@ void TimelineWidget::paintRuler(QPainter& p)
 
     const double t0 = std::max(0.0, usToSeconds(timeForX(kHeaderW)) - major);
     const double t1 = usToSeconds(timeForX(w)) + major;
-    p.setPen(QColor(150, 150, 160));
+    p.setPen(QColor(110, 110, 118));
     for (double t = std::floor(t0 / minor) * minor; t <= t1; t += minor) {
         const double x = xForTime(secondsToUs(t));
         if (x < kHeaderW) continue;
@@ -333,7 +334,7 @@ void TimelineWidget::paintRuler(QPainter& p)
             p.drawText(QPointF(x + 3, 11), label);
         }
     }
-    p.setPen(QColor(20, 20, 24));
+    p.setPen(kGridLine);
     p.drawLine(kHeaderW, kRulerH - 1, w, kRulerH - 1);
 }
 
@@ -351,21 +352,21 @@ void TimelineWidget::paintTracks(QPainter& p)
     for (auto& l : m_project->transcriptLines()) lyrics[l.clipId].push_back(std::move(l));
     const int firstAudio = m_project->firstAudioTrack();
     if (firstAudio > 0 && firstAudio < int(tracks.size())) // divider between the video and audio sections
-        p.fillRect(QRect(kHeaderW, trackY(firstAudio) - kSectionGap, w - kHeaderW, kSectionGap), QColor(22, 22, 25));
+        p.fillRect(QRect(kHeaderW, trackY(firstAudio) - kSectionGap, w - kHeaderW, kSectionGap), kBg);
     for (int ti = 0; ti < int(tracks.size()); ++ti) {
         const int y = trackY(ti);
         const bool audio = tracks[ti].isAudio();
         QColor bg = ti % 2 ? kTrackB : kTrackA;
         if (audio) bg = QColor(bg.red() - 2, bg.green() + 3, bg.blue() - 1);
         p.fillRect(QRect(kHeaderW, y, w - kHeaderW, kTrackH), bg);
-        p.setPen(QColor(25, 25, 28));
+        p.setPen(kGridLine);
         p.drawLine(kHeaderW, y + kTrackH - 1, w, y + kTrackH - 1);
 
         for (const auto& c : tracks[ti].clips) {
             const QRectF r = clipRect(ti, c);
             if (r.right() < kHeaderW || r.left() > w) continue;
             const MediaItem* m = m_project->mediaById(c.mediaId);
-            QColor col = clipColor(m, audio);
+            QColor col = c.isText() ? QColor(150, 66, 170) : clipColor(m, audio);   // text overlays: purple
             if ((!audio && tracks[ti].hidden) || (audio && tracks[ti].muted)) col = col.darker(170);
 
             p.setRenderHint(QPainter::Antialiasing, true);
@@ -424,6 +425,7 @@ void TimelineWidget::paintTracks(QPainter& p)
             p.setPen(Qt::white);
             const QRectF textR = r.adjusted(5, 1, -4, 0);
             QString label = c.linkId.isEmpty() ? c.name : QStringLiteral("\u26AD ") + c.name; // linked mark
+            if (c.isText()) label = QStringLiteral("T  ") + c.text->text.simplified();
             if (c.freeze) label += tr("  [freeze]");
             if (c.reverse) label += tr("  [reverse]");
             if (c.speed != 1.0) label += QStringLiteral("  [%1x]").arg(c.speed, 0, 'g', 3);
@@ -453,24 +455,28 @@ void TimelineWidget::paintHeaders(QPainter& p)
     const int firstAudio = m_project->firstAudioTrack();
     if (firstAudio > 0 && firstAudio < int(tracks.size())) {
         const QRect gap(0, trackY(firstAudio) - kSectionGap, kHeaderW, kSectionGap);
-        p.fillRect(gap, QColor(22, 22, 25));
+        p.fillRect(gap, kBg);
     }
     for (int ti = 0; ti < int(tracks.size()); ++ti) {
         const int y = trackY(ti);
         const bool audio = tracks[ti].isAudio();
         p.fillRect(QRect(0, y, kHeaderW, kTrackH), kHeaderBg);
         p.fillRect(QRect(0, y, 4, kTrackH - 1), audio ? kAudioTag : kVideoTag); // section colour tag
-        p.setPen(QColor(25, 25, 28));
+        p.setPen(kGridLine);
         p.drawLine(0, y + kTrackH - 1, kHeaderW, y + kTrackH - 1);
         p.drawLine(kHeaderW - 1, y, kHeaderW - 1, y + kTrackH);
-        p.setPen(QColor(225, 225, 230));
+        p.setPen(QColor(228, 228, 231));
         p.drawText(QRect(10, y + 6, kHeaderW - 16, 20), Qt::AlignLeft | Qt::AlignVCenter, tracks[ti].name);
-        p.setPen(QColor(140, 140, 150));
+        p.setPen(QColor(120, 120, 128));
         p.drawText(QRect(10, y + 30, 40, 18), Qt::AlignLeft | Qt::AlignVCenter, audio ? tr("Audio") : tr("Video"));
 
         auto toggle = [&](const QRect& r, const QString& label, bool on, const QColor& onColor) {
-            p.fillRect(r, on ? onColor : QColor(70, 70, 78));
-            p.setPen(on ? Qt::black : QColor(200, 200, 205));
+            QPainterPath chip;
+            chip.addRoundedRect(QRectF(r), 3, 3);
+            p.setRenderHint(QPainter::Antialiasing, true);
+            p.fillPath(chip, on ? onColor : QColor(40, 40, 45));
+            p.setRenderHint(QPainter::Antialiasing, false);
+            p.setPen(on ? Qt::black : QColor(165, 165, 172));
             p.drawText(r, Qt::AlignCenter, label);
         };
         if (audio) {

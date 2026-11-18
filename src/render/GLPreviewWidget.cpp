@@ -5,6 +5,10 @@
 
 namespace ve {
 
+QObject* PreviewView::inputObject() { return widget(); }
+void PreviewView::setCursorShape(Qt::CursorShape shape) { widget()->setCursor(shape); }
+
+
 GLPreviewWidget::GLPreviewWidget(QWidget* parent)
     : QOpenGLWidget(parent)
 {

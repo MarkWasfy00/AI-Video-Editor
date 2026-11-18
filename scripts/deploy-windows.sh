@@ -36,7 +36,7 @@ for plugin in "$DIST"/*/*.dll; do copy_deps "$plugin"; done
 
 # Voice/music separation script (its Python environment is set up on first use)
 mkdir -p "$DIST/separator"
-cp "$(cd "$(dirname "$0")/.." && pwd)/separator/separate.py" "$(cd "$(dirname "$0")/.." && pwd)/separator/transcribe.py" "$DIST/separator/"
+cp "$(cd "$(dirname "$0")/.." && pwd)/separator/separate.py" "$(cd "$(dirname "$0")/.." && pwd)/separator/transcribe.py" "$(cd "$(dirname "$0")/.." && pwd)/separator/upscale.py" "$(cd "$(dirname "$0")/.." && pwd)/separator/tts.py" "$(cd "$(dirname "$0")/.." && pwd)/separator/translate.py" "$DIST/separator/"
 
 # Claude panel: the bridge script + Claude Agent SDK. The SDK's optional
 # native Claude Code binary is skipped; the bridge then uses the user's own

@@ -338,19 +338,26 @@ void Inspector::reload()
         const bool audio = ti >= 0 && m_project->tracks()[ti].isAudio();
         const bool linked = !m_project->linkedClips(m_clipId).isEmpty();
         m_title->setText(c->name);
-        m_info->setText(tr("%1 clip%2  |  Start %3  |  Length %4  |  Source in %5")
-                            .arg(audio ? tr("Audio") : tr("Video"), linked ? tr(" (linked)") : QString(),
-                                 formatTimecode(c->start, fps), formatTimecode(c->duration, fps),
-                                 formatTimecode(c->in, fps)));
+        if (c->isText())
+            m_info->setText(tr("Text clip  |  Start %1  |  Length %2  |  Words, font and animation: Text panel")
+                                .arg(formatTimecode(c->start, fps), formatTimecode(c->duration, fps)));
+        else
+            m_info->setText(tr("%1 clip%2  |  Start %3  |  Length %4  |  Source in %5")
+                                .arg(audio ? tr("Audio") : tr("Video"), linked ? tr(" (linked)") : QString(),
+                                     formatTimecode(c->start, fps), formatTimecode(c->duration, fps),
+                                     formatTimecode(c->in, fps)));
         // Pictures are edited on the video clip, sound on the audio clip.
         m_transformBox->setEnabled(!audio);
         m_effectsBox->setEnabled(!audio);
         m_cropBox->setEnabled(!audio);
         m_volumeRow->setEnabled(audio);
-        m_speedBox->setEnabled(!c->freeze);
+        m_speedBox->setEnabled(!c->freeze && !c->isText());
+        m_fitRow->setEnabled(!audio && !c->isText());   // text: no source picture to crop or fit
+        if (c->isText()) m_cropBox->setEnabled(false);
         {
             QString info;
-            if (c->freeze) info = tr("Freeze frame: holds the frame at %1").arg(formatTimecode(c->in, fps));
+            if (c->isText()) info = tr("Text overlay");
+            else if (c->freeze) info = tr("Freeze frame: holds the frame at %1").arg(formatTimecode(c->in, fps));
             else info = tr("Shows %1 of footage").arg(formatTimecode(c->sourceSpan(), fps));
             m_timeInfo->setText(info);
         }

@@ -358,12 +358,47 @@ void McpServer::registerTools()
          [api](const QJsonObject& a, QJsonArray&) {
              return api->audioSeparate(requireStr(a, "clipId"), argStr(a, "keep", "both"), a.value("install").toBool());
          }});
+    add({"video_upscale", "Upscale video (AI super-resolution)",
+         "Increases the resolution of a video clip with a local AI model: FlashVSR (diffusion video "
+         "super-resolution, sharpest, needs an NVIDIA RTX GPU) or Real-ESRGAN (lighter, runs anywhere). Only the part "
+         "of the source the clip shows is processed; the result is a new H.264 file that replaces the clip's source "
+         "(replace=true, default) with the same timing. model empty = the model chosen for this computer (see "
+         "ai_models: pick a model whose fit is not 'Too heavy'). scale 2 or 4 (default: automatic, 4x up to 4K output). "
+         "Slow: FlashVSR takes seconds per frame on most GPUs. Pass install=true only if the user agreed to the "
+         "one-time download (FlashVSR about 7 GB, Real-ESRGAN under 70 MB, plus PyTorch ~2.5 GB).",
+         object({{"clipId", str("Video clip")},
+                 {"model", enumStr({"flashvsr-full", "flashvsr-tiny", "flashvsr-tiny-long", "realesrgan-x4plus",
+                                    "realesrgan-general"}, "Upscale model (default: the selected one)")},
+                 {"scale", integer("2 or 4 (default automatic)")},
+                 {"replace", boolean("Use the upscaled file in the clip (default true); false only imports it")},
+                 {"force", boolean("Run even if the model is too heavy for this computer (default false)")},
+                 {"install", boolean("Run the one-time setup if needed (default false)")}}, {"clipId"}),
+         false, false, false,
+         [api](const QJsonObject& a, QJsonArray&) {
+             return api->videoUpscale(requireStr(a, "clipId"), argStr(a, "model"), int(argNum(a, "scale", 0)),
+                                      !a.contains("replace") || a.value("replace").toBool(), a.value("install").toBool(),
+                                      a.value("force").toBool());
+         }});
+    add({"ai_models", "Local AI models and hardware",
+         "This computer's hardware (RAM, NVIDIA GPU and VRAM) and every local AI model per task (upscale, transcribe, "
+         "separate): what it needs, whether it fits here (Runs well / Runs slowly / Too heavy / Not supported), "
+         "whether it is installed, the recommended one and the selected one. 'limited' lists the tasks where this "
+         "computer cannot run the best model well. Check it before upscaling, transcribing or separating.",
+         object({}), true, false, true,
+         [api](const QJsonObject&, QJsonArray&) { return api->aiModels(); }});
+    add({"ai_model_select", "Choose a local AI model",
+         "Sets the model used for a task (upscale, transcribe, separate). model = a model id from ai_models, or "
+         "'recommended' for the best fit for this computer. Prefer the recommended model on limited hardware.",
+         object({{"task", enumStr({"upscale", "transcribe", "separate", "translate"}, "Task")},
+                 {"model", str("Model id, or 'recommended'")}}, {"task", "model"}),
+         false, false, true,
+         [api](const QJsonObject& a, QJsonArray&) { return api->aiModelSelect(requireStr(a, "task"), requireStr(a, "model")); }});
     add({"transcript_create", "Transcribe audio",
-         "Transcribes speech or song lyrics of a clip with OpenAI Whisper (turbo, local GPU), with timestamps for "
+         "Transcribes speech or song lyrics of a clip with OpenAI Whisper (the model selected in ai_models; local GPU when possible), with timestamps for "
          "every line and word. Works on an audio clip or a video clip with linked audio. For songs the voice is "
          "separated from the music first when separation is installed (isolateVoice auto). The transcript belongs "
          "to the media file and appears wherever its clips are on the timeline. Pass install=true only if the user "
-         "agreed to the one-time download (~1.6 GB).",
+         "agreed to the one-time download (turbo ~1.6 GB, small ~0.5 GB, base ~0.15 GB).",
          object({{"clipId", str("Audio clip, or a video clip with linked audio")},
                  {"language", str("auto (default), a language code such as en, ar, es, fr, de, or ar-EG for "
                                   "Egyptian Arabic (dialect-aware spelling)")},
@@ -381,33 +416,74 @@ void McpServer::registerTools()
          "segments (source seconds, used by transcript_update). Without an id: everything on the timeline.",
          object({{"id", str("Optional clip id or media id")}}), true, false, true,
          [api](const QJsonObject& a, QJsonArray&) { return api->transcriptGet(argStr(a, "id")); }});
-    add({"transcript_update", "Edit transcript",
-         "Edits one transcript segment of a media file: new text (fix a word / lyric), new start/end (source "
-         "seconds), delete=true, or insert={start, end, text} to add a line.",
+    add({"transcript_update", "Edit transcript / subtitles",
+         "Edits one transcript segment (subtitle line) of a media file: new text (fix a word / lyric), new start/end "
+         "(source seconds), delete=true, split=<source seconds> (cut the line in two there), merge=true (join with the "
+         "next line), translation={language, text} (fix one translated line), or insert={start, end, text} to add a line.",
          object({{"mediaId", str("Media id (see transcript_get)")}, {"segment", integer("Segment index")},
                  {"text", str("New text")}, {"start", num("New start, source seconds")},
                  {"end", num("New end, source seconds")}, {"delete", boolean("Remove the segment")},
+                 {"split", num("Split the segment at this source time")},
+                 {"merge", boolean("Merge the segment with the next one")},
+                 {"translation", QJsonObject{{"type", "object"}, {"description", "{language, text}: replace one translated line"}}},
                  {"insert", QJsonObject{{"type", "object"}, {"description", "{start, end, text} in source seconds"}}}},
                 {"mediaId"}),
          false, false, false,
          [api](const QJsonObject& a, QJsonArray&) { return api->transcriptUpdate(a); }});
+    add({"transcript_shift", "Shift subtitle timing",
+         "Moves subtitle lines earlier (negative seconds) or later: every transcript, or one media's transcript "
+         "(optionally only segments from..to). For a sync offset of the on-screen captions only, use captions_set delay.",
+         object({{"seconds", num("Seconds to move, + = later")}, {"mediaId", str("Optional media id (default: every transcript)")},
+                 {"from", integer("First segment (with mediaId)")}, {"to", integer("Last segment (with mediaId)")}},
+                {"seconds"}),
+         false, false, false,
+         [api](const QJsonObject& a, QJsonArray&) { return api->transcriptShift(a); }});
+    add({"transcript_import", "Import subtitles",
+         "Reads a subtitle file (.srt, .vtt or .lrc; times on the timeline) into the transcript of a clip's sound, "
+         "so it can be edited, styled as captions, translated or voiced.",
+         object({{"clipId", str("Audio clip, or a video clip with linked audio")}, {"path", str("Subtitle file")},
+                 {"replace", boolean("Replace the existing transcript (default true); false = add the lines")}},
+                {"clipId", "path"}),
+         false, false, false,
+         [api](const QJsonObject& a, QJsonArray&) {
+             return api->transcriptImport(requireStr(a, "clipId"), requireStr(a, "path"), a.value("replace").toBool(true));
+         }});
+    add({"transcript_translate", "Translate subtitles",
+         "Translates the transcripts on the timeline (or one media's) with Meta's NLLB-200 model, on this computer "
+         "(GPU when possible). The translation is stored next to the transcript; showCaptions puts it on screen "
+         "(captions language). Pass install=true only if the user agreed to the one-time download (~2.5 GB).",
+         object({{"language", str("Target language code: en, ar, ar-EG (Egyptian), es, fr, de, it, pt, ru, tr, hi, ja, ko, zh, ...")},
+                 {"mediaId", str("Optional: only this media's transcript")},
+                 {"showCaptions", boolean("Show the translation as the on-screen captions (default true)")},
+                 {"install", boolean("Run the one-time setup if needed (default false)")}},
+                {"language"}),
+         false, false, false,
+         [api](const QJsonObject& a, QJsonArray&) {
+             return api->transcriptTranslate(requireStr(a, "language"), argStr(a, "mediaId"), a.value("install").toBool(),
+                                             a.value("showCaptions").toBool(true));
+         }});
     add({"transcript_export", "Export transcript",
-         "Writes the timeline's transcript as subtitles or lyrics: srt, vtt, lrc (synced lyrics) or txt.",
-         object({{"path", str("Output file")}, {"format", enumStr({"srt", "vtt", "lrc", "txt"}, "Default: from the file extension")}},
+         "Writes the timeline's transcript (or a translation of it) as subtitles or lyrics: srt, vtt, lrc (synced lyrics) or txt.",
+         object({{"path", str("Output file")}, {"format", enumStr({"srt", "vtt", "lrc", "txt"}, "Default: from the file extension")},
+                 {"language", str("Export this translation instead of the transcript (e.g. en)")}},
                 {"path"}),
          false, false, true,
-         [api](const QJsonObject& a, QJsonArray&) { return api->transcriptExport(requireStr(a, "path"), argStr(a, "format")); }});
+         [api](const QJsonObject& a, QJsonArray&) {
+             return api->transcriptExport(requireStr(a, "path"), argStr(a, "format"), argStr(a, "language"));
+         }});
     add({"captions_get", "Get captions",
          "On-screen captions (CapCut-style text over the video) generated from the transcript: current style, "
-         "presets and the first captions.",
+         "presets, highlight modes, animations, available translations and the first captions.",
          object({}), true, false, true,
          [api](const QJsonObject&, QJsonArray&) { return api->captionsGet(); }});
     add({"captions_set", "Set captions",
          "Turns on-screen captions on/off and styles them. Arabic captions are laid out right to left automatically "
          "with an Arabic font. preset: arabic (tuned for Arabic), classic (white, black outline, yellow word), "
          "bold (big caps, thick outline, centred), box (text on a dark box), neon (glow), minimal (whole line, "
-         "no highlight), karaoke (coloured box behind the spoken word). Any field overrides the preset. Text comes "
-         "from the transcript (fix words with transcript_update). Check the result with render_frame.",
+         "no highlight), karaoke (coloured box behind the spoken word), sweep (karaoke colour fill through each word), "
+         "wordpop (words appear one by one, the spoken one bigger), typewriter, cinema (film subtitles). Any field "
+         "overrides the preset. Text comes from the transcript (fix words with transcript_update). Check the result "
+         "with render_frame.",
          object({{"enabled", boolean("Show captions on the video")},
                  {"preset", enumStr(captionPresetNames(), "Style preset (also turns captions on)")},
                  {"font", str("Installed font family, e.g. Arial Black, Impact, Segoe UI Black (see suggestedFonts in captions_get)")},
@@ -417,7 +493,9 @@ void McpServer::registerTools()
                  {"bold", boolean("Bold")}, {"italic", boolean("Italic")}, {"uppercase", boolean("ALL CAPS")},
                  {"size", num("Text height as a fraction of the frame height (0.015 - 0.3, default 0.065)")},
                  {"color", str("Text color, e.g. #FFFFFF")}, {"highlight", str("Color of the spoken word")},
-                 {"highlightMode", enumStr({"color", "box", "none"}, "How the spoken word is shown")},
+                 {"highlightMode", enumStr(captionHighlightModes(),
+                                           "How the spoken word is shown: color, box (behind it), karaoke (colour sweeps "
+                                           "through each word), spoken (every word said so far), grow (bigger), underline, none")},
                  {"outline", str("Outline color")}, {"outlineWidth", num("Outline thickness, fraction of the font size (0 - 0.5)")},
                  {"shadow", boolean("Drop shadow")}, {"box", boolean("Background box")}, {"boxColor", str("Box color")},
                  {"boxOpacity", num("Box opacity 0 - 1")},
@@ -425,9 +503,86 @@ void McpServer::registerTools()
                  {"offset", num("Distance from that edge (bottom/top) or shift down from centre, fraction of frame height")},
                  {"wordsPerCaption", integer("Words shown at a time (0 = the whole line)")},
                  {"maxLines", integer("Lines per caption 1 - 4")},
-                 {"animation", enumStr({"pop", "fade", "none"}, "How each caption appears")}}),
+                 {"animation", enumStr(captionAnimations(),
+                                       "How each caption appears: pop, fade, slide, bounce, zoom, reveal (words appear "
+                                       "as they are said), typewriter, none")},
+                 {"language", str("Show a translation instead of the transcript (e.g. en); empty = the transcript")},
+                 {"bilingual", boolean("With a translation: the original line under it, smaller")},
+                 {"delay", num("Seconds to move every caption later (+) or earlier (-), -30 .. 30")}}),
          false, false, true,
          [api](const QJsonObject& a, QJsonArray&) { return api->captionsSet(a); }});
+
+    // ---- text overlays
+    const QJsonObject textStyleSchema{
+        {"type", "object"},
+        {"description", "Text style (partial). font, fontFile, bold, italic, underline, uppercase, size (fraction of frame "
+                        "height), color, gradient + color2 (top -> bottom), align (left/center/right), letterSpacing, "
+                        "lineSpacing, maxWidth (fraction of frame width), outline + outlineWidth (fraction of font size), "
+                        "shadow + shadowColor/shadowX/shadowY/shadowBlur, background + backgroundColor/backgroundOpacity/"
+                        "backgroundPadding/backgroundRadius/backgroundMode (block/lines). Colors #RRGGBB or #AARRGGBB."}};
+    const QJsonObject textAnimSchema{
+        {"type", "object"},
+        {"description", "Animation (partial): in (" + textAnimationsIn().join(", ") + "), inDuration (s), out (" +
+                            textAnimationsOut().join(", ") + "), outDuration, loop (" + textAnimationsLoop().join(", ") +
+                            "), loopSpeed (cycles per second)"}};
+    add({"text_templates", "List text templates",
+         "Ready-made text looks (titles, lower thirds, social, effects, and the user's saved templates) with their style "
+         "and animation, plus every animation name.",
+         object({}), true, false, true,
+         [api](const QJsonObject&, QJsonArray&) { return api->textTemplates(); }});
+    add({"text_add", "Add text",
+         "Adds a text overlay (title, lower third, sticker ...) as a clip on a video track, above the footage. Start from "
+         "a template and/or set the style and animation. Multi-line text: use \\n. Arabic is laid out right to left. "
+         "Move / scale / rotate it with transform (or clip_update). " + timeNote,
+         object({{"text", str("The words (default: the template's)")}, {"template", str("Template id from text_templates")},
+                 {"start", num("Timeline start (default: playhead)")}, {"duration", num("Seconds on screen (default 4)")},
+                 {"track", integer("Optional video track (default: the top track if free, else a new one)")},
+                 {"style", textStyleSchema}, {"animation", textAnimSchema}, {"transform", kTransformSchema}}),
+         false, false, false,
+         [api](const QJsonObject& a, QJsonArray&) { return api->textAdd(a); }});
+    add({"text_update", "Edit text",
+         "Changes a text clip's words, style or animation (partial), or re-styles it from a template (keeping its words).",
+         object({{"clipId", str("Text clip id")}, {"text", str("New words")}, {"template", str("Template id")},
+                 {"style", textStyleSchema}, {"animation", textAnimSchema}}, {"clipId"}),
+         false, false, true,
+         [api](const QJsonObject& a, QJsonArray&) { return api->textUpdate(requireStr(a, "clipId"), a); }});
+    add({"text_template_save", "Save text template",
+         "Saves a text clip's style, animation, position and length as a custom template (same name = replace).",
+         object({{"clipId", str("Text clip id")}, {"name", str("Template name")}}, {"clipId", "name"}),
+         false, false, true,
+         [api](const QJsonObject& a, QJsonArray&) { return api->textTemplateSave(requireStr(a, "clipId"), requireStr(a, "name")); }});
+    add({"text_template_delete", "Delete text template", "Deletes a custom text template.",
+         object({{"id", str("Custom template id (custom-...)")}}, {"id"}), false, true, true,
+         [api](const QJsonObject& a, QJsonArray&) { return api->textTemplateDelete(requireStr(a, "id")); }});
+
+    // ---- text to speech
+    add({"tts_voices", "List speech voices",
+         "Text-to-speech engines and voices: system (Windows voices, offline), piper (neural, offline, ~60 MB per "
+         "voice), edge (Microsoft neural voices incl. Egyptian Arabic; online: the text is sent to Microsoft).",
+         object({{"engine", enumStr({"system", "piper", "edge"}, "Only this engine")}}), true, false, true,
+         [api](const QJsonObject& a, QJsonArray&) { return api->ttsVoices(argStr(a, "engine")); }});
+    add({"tts_speak", "Text to speech",
+         "Speaks text (or a text clip's words) with a voice and adds it as an audio clip (voice-over). Use the edge "
+         "engine only if the user agreed to send the text online. Pass install=true only if the user agreed to set up "
+         "piper / edge (small downloads). " + timeNote,
+         object({{"text", str("Words to speak")}, {"clipId", str("Or a text clip: speaks its words at its start")},
+                 {"engine", enumStr({"system", "piper", "edge"}, "Default: system on Windows")},
+                 {"voice", str("Voice id from tts_voices (default: one for language)")},
+                 {"language", str("Pick a voice for this language when no voice is given (e.g. en, ar-EG)")},
+                 {"rate", num("Speed 0.5 - 2 (1 = normal)")}, {"start", num("Timeline start (default: playhead)")},
+                 {"track", integer("Optional audio track")}, {"install", boolean("Set up the engine / voice if needed")}}),
+         false, false, false,
+         [api](const QJsonObject& a, QJsonArray&) { return api->ttsSpeak(a); }});
+    add({"tts_subtitles", "Voice-over from subtitles",
+         "Speaks every subtitle line (the transcript, or a translation of it: dubbing) at its time, on a new "
+         "'Voice-over' audio track. originalVolume turns the original speech down (e.g. 0.2).",
+         object({{"language", str("A translation to speak (default: the transcript)")},
+                 {"engine", enumStr({"system", "piper", "edge"}, "Default: system on Windows")},
+                 {"voice", str("Voice id (default: one for the language)")}, {"rate", num("Speed 0.5 - 2")},
+                 {"originalVolume", num("Volume of the original clips under the voice-over (0 - 4)")},
+                 {"install", boolean("Set up the engine / voice if needed")}}),
+         false, false, false,
+         [api](const QJsonObject& a, QJsonArray&) { return api->ttsSubtitles(a); }});
     add({"clip_update", "Update clip properties",
          "Changes a clip's name, transform (position/scale/rotation/opacity), GPU effects (brightness, contrast, "
          "saturation, hue, blur, vignette, grayscale, invert), volume and fades. Partial updates; omitted fields keep "

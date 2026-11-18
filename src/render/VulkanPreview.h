@@ -49,6 +49,8 @@ public:
     QString backendDescription() const override;
     bool hasDevice() const { return !m_window->availablePhysicalDevices().isEmpty(); }
     QString deviceName() const { return m_deviceName; }
+    QObject* inputObject() override { return m_window; }
+    void setCursorShape(Qt::CursorShape shape) override { m_window->setCursor(shape); }
 
 private:
     VulkanPreviewWindow* m_window = nullptr;

@@ -116,18 +116,30 @@ QStringList CaptionRenderer::suggestedArabicFonts()
     return out;
 }
 
-QImage CaptionRenderer::render(const CaptionStyle& s, const QStringList& wordsIn, int highlight, int canvasW, int canvasH)
+QImage CaptionRenderer::render(const CaptionStyle& s, const QStringList& words, int highlight, int canvasW, int canvasH)
 {
-    QStringList words = wordsIn;
+    Frame f;
+    f.words = words;
+    f.highlight = highlight;
+    return render(s, f, canvasW, canvasH);
+}
+
+QImage CaptionRenderer::render(const CaptionStyle& s, const Frame& fr, int canvasW, int canvasH)
+{
+    QStringList words = fr.words;
     if (s.uppercase)
         for (QString& w : words) w = w.toUpper();   // no effect on Arabic
     if (words.isEmpty()) return {};
+    const int highlight = fr.highlight;
+    const QString& mode = s.highlightMode;
 
     // Arabic captions run right to left; Arabic words get an Arabic-capable font.
     int arabicWords = 0;
     for (const QString& w : words) arabicWords += isArabic(w) ? 1 : 0;
     const bool rtl = arabicWords * 2 >= words.size() && arabicWords > 0;
-    const QString arFamily = arabicWords > 0 ? arabicFamily(s) : QString();
+    const QString secondary = fr.secondary.trimmed();
+    const bool secondaryArabic = isArabic(secondary);
+    const QString arFamily = (arabicWords > 0 || secondaryArabic) ? arabicFamily(s) : QString();
 
     const double maxWidth = canvasW * 0.86;
     double px = s.size * canvasH;
@@ -165,10 +177,38 @@ QImage CaptionRenderer::render(const CaptionStyle& s, const QStringList& wordsIn
     const double fontH = mixed ? std::max(lfm.height(), afm.height()) : lfm.height();
     const double lineH = fontH * 1.08;
     const double stroke = s.outlineWidth * px;
-    const double pad = std::ceil(stroke + px * (s.box ? 0.35 : 0.12) + (s.shadow ? px * 0.08 : 0.0) + 2);
-    const double contentW = *std::max_element(lineWidth.begin(), lineWidth.end());
+
+    // Bilingual: the original line, smaller, wrapped under the caption.
+    QFont secFont = secondaryArabic && !arFamily.isEmpty() ? arabic : latin;
+    secFont.setPixelSize(std::max(6, int(std::lround(px * 0.62))));
+    secFont.setBold(false);
+    const QFontMetricsF sfm(secFont);
+    QStringList secLines;
+    if (!secondary.isEmpty()) {
+        QString cur;
+        for (const QString& w : secondary.split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
+            const QString cand = cur.isEmpty() ? w : cur + QLatin1Char(' ') + w;
+            if (!cur.isEmpty() && sfm.horizontalAdvance(cand) > maxWidth) {
+                secLines << cur;
+                cur = w;
+            } else {
+                cur = cand;
+            }
+        }
+        if (!cur.isEmpty()) secLines << cur;
+    }
+    const double secLineH = sfm.height() * 1.05;
+    double secW = 0;
+    for (const QString& l : secLines) secW = std::max(secW, sfm.horizontalAdvance(l));
+
+    const double grow = mode == QLatin1String("grow") ? 0.18 : 0.0;
+    const double pad = std::ceil(stroke + px * (s.box ? 0.35 : 0.12) + (s.shadow ? px * 0.08 : 0.0) + px * grow * 0.6 + 2);
+    const double mainW = *std::max_element(lineWidth.begin(), lineWidth.end());
+    const double contentW = std::max(mainW, secW);
+    const double mainH = lineH * lineWidth.size();
+    const double secGap = secLines.isEmpty() ? 0.0 : px * 0.15;
     const int w = int(std::ceil(contentW + 2 * pad)) & ~1;
-    const int h = int(std::ceil(lineH * lineWidth.size() + 2 * pad)) & ~1;
+    const int h = int(std::ceil(mainH + secGap + secLineH * secLines.size() + 2 * pad)) & ~1;
     if (w <= 0 || h <= 0) return {};
 
     QImage img(w + 2, h + 2, QImage::Format_RGBA8888_Premultiplied);
@@ -180,27 +220,56 @@ QImage CaptionRenderer::render(const CaptionStyle& s, const QStringList& wordsIn
     auto lineLeft = [&](int line) { return pad + (contentW - lineWidth[size_t(line)]) / 2.0; }; // centred
     auto baseline = [&](int line) { return pad + line * lineH + (lineH - fontH) / 2 + ascent; };
 
-    if (s.box) {   // one rounded box per line
+    // Which words show (reveal) and how many letters of each (typewriter).
+    auto shownText = [&](int i) -> QString {
+        const QString& t = placed[size_t(i)].text;
+        if (fr.visibleWords >= 0 && i >= fr.visibleWords) return {};
+        if (fr.visibleChars < 0) return t;
+        int before = 0;
+        for (int k = 0; k < i; ++k) before += int(placed[size_t(k)].text.size()) + 1;
+        return t.left(std::max(0, fr.visibleChars - before));
+    };
+
+    if (s.box) {   // one rounded box per line (and one per bilingual line)
         QColor bc = s.boxColor;
         bc.setAlphaF(float(s.boxOpacity));
+        p.setPen(Qt::NoPen);
+        p.setBrush(bc);
         for (int l = 0; l < int(lineWidth.size()); ++l) {
             const QRectF r(lineLeft(l) - px * 0.3, pad + l * lineH - px * 0.08, lineWidth[size_t(l)] + px * 0.6, lineH + px * 0.1);
-            p.setPen(Qt::NoPen);
-            p.setBrush(bc);
             p.drawRoundedRect(r, px * 0.22, px * 0.22);
+        }
+        for (int l = 0; l < int(secLines.size()); ++l) {
+            const double lw = sfm.horizontalAdvance(secLines[l]);
+            const QRectF r(pad + (contentW - lw) / 2 - px * 0.2, pad + mainH + secGap + l * secLineH - px * 0.04,
+                           lw + px * 0.4, secLineH + px * 0.08);
+            p.drawRoundedRect(r, px * 0.15, px * 0.15);
         }
     }
 
     for (int i = 0; i < int(placed.size()); ++i) {
         const Placed& pw = placed[size_t(i)];
-        const double x = lineLeft(pw.line) + pw.x;
+        const QString shown = shownText(i);
+        if (shown.isEmpty()) continue;
+        double x = lineLeft(pw.line) + pw.x;
         const double y = baseline(pw.line);
         const QFont& f = fontFor(pw.text);
+        if (shown.size() < pw.text.size() && isArabic(pw.text))   // an RTL word is typed from its right edge
+            x += pw.w - QFontMetricsF(f).horizontalAdvance(shown);
         QPainterPath path;
-        path.addText(QPointF(x, y), f, pw.text);   // HarfBuzz shaping: Arabic letters join
+        path.addText(QPointF(x, y), f, shown);   // HarfBuzz shaping: Arabic letters join
         const bool active = i == highlight;
+        const bool said = highlight >= 0 && i < highlight;
 
-        if (active && s.highlightMode == QLatin1String("box")) {
+        if (active && mode == QLatin1String("grow")) {   // the spoken word bigger, around its centre
+            const QPointF c(x + pw.w / 2, y - ascent / 2);
+            QTransform tr;
+            tr.translate(c.x(), c.y());
+            tr.scale(1.0 + grow, 1.0 + grow);
+            tr.translate(-c.x(), -c.y());
+            path = tr.map(path);
+        }
+        if (active && mode == QLatin1String("box")) {
             const QRectF r(x - px * 0.14, y - ascent - px * 0.04, pw.w + px * 0.28, fontH + px * 0.08);
             p.setPen(Qt::NoPen);
             p.setBrush(s.highlight);
@@ -222,12 +291,62 @@ QImage CaptionRenderer::render(const CaptionStyle& s, const QStringList& wordsIn
             }
             p.strokePath(path, QPen(s.outline, 2 * stroke, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         }
-        const QColor fill = (active && s.highlightMode == QLatin1String("color")) ? s.highlight : s.color;
-        p.fillPath(path, fill);
+        QColor fill = s.color;
+        if (active && (mode == QLatin1String("color") || mode == QLatin1String("grow") || mode == QLatin1String("spoken")))
+            fill = s.highlight;
+        if (said && (mode == QLatin1String("spoken") || mode == QLatin1String("karaoke"))) fill = s.highlight;
+        if (active && mode == QLatin1String("karaoke")) {
+            // The colour sweeps through the word as it is sung (from where it starts reading).
+            p.fillPath(path, s.color);
+            const double sw = pw.w * std::clamp(fr.progress, 0.0, 1.0);
+            const QRectF clip = isArabic(pw.text) ? QRectF(x + pw.w - sw, y - ascent - px, sw, fontH + 2 * px)
+                                                  : QRectF(x, y - ascent - px, sw, fontH + 2 * px);
+            p.save();
+            p.setClipRect(clip);
+            p.fillPath(path, s.highlight);
+            p.restore();
+        } else {
+            p.fillPath(path, fill);
+        }
+        if (active && mode == QLatin1String("underline")) {
+            const QRectF r(x, y + px * 0.12, pw.w, std::max(2.0, px * 0.09));
+            p.setPen(Qt::NoPen);
+            p.setBrush(s.highlight);
+            p.drawRoundedRect(r, r.height() / 2, r.height() / 2);
+        }
+    }
+
+    // Bilingual line (once the main words are all there)
+    if (!secLines.isEmpty() && (fr.visibleWords < 0 || fr.visibleWords >= int(placed.size())) && fr.visibleChars < 0) {
+        QColor sc = s.color;
+        sc.setAlphaF(0.92f);
+        for (int l = 0; l < int(secLines.size()); ++l) {
+            const double lw = sfm.horizontalAdvance(secLines[l]);
+            QPainterPath path;
+            path.addText(QPointF(pad + (contentW - lw) / 2, pad + mainH + secGap + l * secLineH + sfm.ascent()), secFont, secLines[l]);
+            if (stroke > 0)
+                p.strokePath(path, QPen(s.outline, 1.4 * stroke * 0.62, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            else if (s.shadow)
+                p.fillPath(path.translated(px * 0.04, px * 0.05), QColor(0, 0, 0, 150));
+            p.fillPath(path, sc);
+        }
     }
     p.end();
     return img.convertToFormat(QImage::Format_RGBA8888);
 }
+
+namespace {
+double easeOutBounce(double p)
+{
+    p = std::clamp(p, 0.0, 1.0);
+    const double n = 7.5625, d = 2.75;
+    if (p < 1 / d) return n * p * p;
+    if (p < 2 / d) { p -= 1.5 / d; return n * p * p + 0.75; }
+    if (p < 2.5 / d) { p -= 2.25 / d; return n * p * p + 0.9375; }
+    p -= 2.625 / d;
+    return n * p * p + 0.984375;
+}
+} // namespace
 
 bool CaptionRenderer::layerAt(const TimelineSnapshot& s, TimeUs t, Layer& out)
 {
@@ -239,20 +358,39 @@ bool CaptionRenderer::layerAt(const TimelineSnapshot& s, TimeUs t, Layer& out)
     --it;
     const CaptionChunk& c = *it;
     if (t >= c.end) return false;
+    const CaptionStyle& st = s.captions;
 
-    int highlight = -1;
+    Frame fr;
+    for (const auto& w : c.words) fr.words << w.text;
+    fr.secondary = c.secondary;
+    int said = 0;
     for (int i = 0; i < int(c.words.size()); ++i)
-        if (c.words[size_t(i)].start <= t) highlight = i;
-    if (s.captions.highlightMode == QLatin1String("none")) highlight = -1;
+        if (c.words[size_t(i)].start <= t) {
+            fr.highlight = i;
+            said = i + 1;
+        }
+    if (fr.highlight >= 0 && st.highlightMode == QLatin1String("karaoke")) {
+        const auto& w = c.words[size_t(fr.highlight)];
+        const double p = double(t - w.start) / double(std::max<TimeUs>(1, w.end - w.start));
+        fr.progress = std::round(std::clamp(p, 0.0, 1.0) * 12.0) / 12.0;   // 12 steps per word (cache)
+    }
+    if (st.highlightMode == QLatin1String("none")) fr.highlight = -1;
+    const double e = usToSeconds(t - c.start), left = usToSeconds(c.end - t);
+    if (st.animation == QLatin1String("reveal")) fr.visibleWords = std::max(1, said);
+    if (st.animation == QLatin1String("typewriter")) {
+        const int chars = int(fr.words.join(QLatin1Char(' ')).size());
+        const double typing = std::min(usToSeconds(c.end - c.start) * 0.6, chars * 0.045);
+        if (typing > 0 && e < typing) fr.visibleChars = std::max(1, int(std::ceil(e / typing * chars)));
+    }
 
     const int cw = s.settings.width, ch = s.settings.height;
-    QStringList words;
-    for (const auto& w : c.words) words << w.text;
-    const QString key = QString::fromUtf8(QJsonDocument(s.captions.toJson()).toJson(QJsonDocument::Compact)) +
-                        QStringLiteral("|%1x%2|%3|").arg(cw).arg(ch).arg(highlight) + words.join(QLatin1Char('\x1f'));
+    const QString key = QString::fromUtf8(QJsonDocument(st.toJson()).toJson(QJsonDocument::Compact)) +
+                        QStringLiteral("|%1x%2|%3|%4|%5|%6|").arg(cw).arg(ch).arg(fr.highlight).arg(fr.progress)
+                            .arg(fr.visibleWords).arg(fr.visibleChars) +
+                        fr.words.join(QLatin1Char('\x1f')) + QLatin1Char('\x1e') + fr.secondary;
     VideoFramePtr frame = m_cache.value(key);
     if (!frame) {
-        const QImage img = render(s.captions, words, highlight, cw, ch);
+        const QImage img = render(st, fr, cw, ch);
         if (img.isNull()) return false;
         auto f = std::make_shared<VideoFrame>();
         f->width = img.width();
@@ -263,32 +401,46 @@ bool CaptionRenderer::layerAt(const TimelineSnapshot& s, TimeUs t, Layer& out)
         frame = f;
         m_cache.insert(key, frame);
         m_order << key;
-        while (m_order.size() > 48) m_cache.remove(m_order.takeFirst());
+        while (m_order.size() > 96) m_cache.remove(m_order.takeFirst());
     }
 
-    // 1 caption pixel = 1 canvas pixel; animation via scale / opacity.
+    // 1 caption pixel = 1 canvas pixel; animation via scale / opacity / position.
     const double fit = std::min(double(cw) / frame->width, double(ch) / frame->height);
     double scale = 1.0 / fit;
     double opacity = 1.0;
-    const double e = usToSeconds(t - c.start), left = usToSeconds(c.end - t);
-    if (s.captions.animation == QLatin1String("pop")) {
+    double dy = 0.0;
+    const QString& anim = st.animation;
+    if (anim == QLatin1String("pop")) {
         if (e < 0.10) scale *= 0.78 + 0.30 * (e / 0.10);        // grow past full size...
         else if (e < 0.18) scale *= 1.08 - 0.08 * ((e - 0.10) / 0.08); // ...and settle
         opacity = std::min(1.0, e / 0.06);
-    } else if (s.captions.animation == QLatin1String("fade")) {
+    } else if (anim == QLatin1String("fade")) {
         opacity = std::clamp(std::min(e, left) / 0.15, 0.0, 1.0);
+    } else if (anim == QLatin1String("slide")) {               // rise into place
+        const double p = std::clamp(e / 0.22, 0.0, 1.0);
+        dy = std::pow(1.0 - p, 3.0) * ch * 0.035;
+        opacity = std::min(1.0, e / 0.12) * std::clamp(left / 0.08, 0.0, 1.0);
+    } else if (anim == QLatin1String("bounce")) {
+        scale *= 0.55 + 0.45 * easeOutBounce(e / 0.35);
+        opacity = std::min(1.0, e / 0.05);
+    } else if (anim == QLatin1String("zoom")) {
+        const double p = std::clamp(e / 0.16, 0.0, 1.0);
+        scale *= 1.35 - 0.35 * (1.0 - std::pow(1.0 - p, 3.0));
+        opacity = std::min(1.0, e / 0.1);
+    } else if (anim == QLatin1String("reveal") || anim == QLatin1String("typewriter")) {
+        opacity = std::clamp(left / 0.08, 0.0, 1.0);
     }
     const double h = frame->height;
     double cy;  // caption centre, canvas pixels
-    if (s.captions.position == QLatin1String("top")) cy = ch * s.captions.offset + h / 2;
-    else if (s.captions.position == QLatin1String("middle")) cy = ch / 2.0 + ch * s.captions.offset;
-    else cy = ch * (1.0 - s.captions.offset) - h / 2;
+    if (st.position == QLatin1String("top")) cy = ch * st.offset + h / 2;
+    else if (st.position == QLatin1String("middle")) cy = ch / 2.0 + ch * st.offset;
+    else cy = ch * (1.0 - st.offset) - h / 2;
 
     out = Layer{};
     out.frame = frame;
     out.transform.scale = scale;
     out.transform.x = 0;
-    out.transform.y = cy - ch / 2.0;
+    out.transform.y = cy - ch / 2.0 + dy;
     out.opacity = opacity;
     return true;
 }

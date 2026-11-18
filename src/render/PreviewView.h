@@ -4,6 +4,7 @@
 
 #include <QString>
 
+class QObject;
 class QWidget;
 
 namespace ve {
@@ -19,6 +20,9 @@ public:
     virtual void setFrame(CompositeFramePtr frame) = 0;
     virtual RenderBackend backend() const = 0;
     virtual QString backendDescription() const = 0;
+    // What receives the mouse (the widget, or the native window for Vulkan).
+    virtual QObject* inputObject();
+    virtual void setCursorShape(Qt::CursorShape shape);
 };
 
 } // namespace ve

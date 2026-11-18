@@ -5,6 +5,7 @@
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QMessageBox>
@@ -55,7 +56,11 @@ CaptionPanel::CaptionPanel(Project* project, QWidget* parent)
         {QStringLiteral("neon"), tr("Neon - glowing outline")},
         {QStringLiteral("minimal"), tr("Minimal - whole line, no highlight")},
         {QStringLiteral("karaoke"), tr("Karaoke - box behind the spoken word")},
-        {QStringLiteral("arabic"), tr("Arabic - large, clear Arabic letters")}};
+        {QStringLiteral("arabic"), tr("Arabic - large, clear Arabic letters")},
+        {QStringLiteral("sweep"), tr("Karaoke sweep - colour fills each word as it is sung")},
+        {QStringLiteral("wordpop"), tr("Word pop - words appear one by one, spoken word bigger")},
+        {QStringLiteral("typewriter"), tr("Typewriter - letters typed on a box")},
+        {QStringLiteral("cinema"), tr("Cinema - plain film subtitles")}};
     for (const auto& [key, label] : presets) m_preset->addItem(label, key);
     presetRow->addWidget(new QLabel(tr("Style"), this));
     presetRow->addWidget(m_preset, 1);
@@ -115,6 +120,10 @@ CaptionPanel::CaptionPanel(Project* project, QWidget* parent)
     m_highlightMode = new QComboBox(hlBox);
     m_highlightMode->addItem(tr("Color the word"), QStringLiteral("color"));
     m_highlightMode->addItem(tr("Box behind the word"), QStringLiteral("box"));
+    m_highlightMode->addItem(tr("Karaoke: colour sweeps through the word"), QStringLiteral("karaoke"));
+    m_highlightMode->addItem(tr("Every word said so far"), QStringLiteral("spoken"));
+    m_highlightMode->addItem(tr("Spoken word bigger"), QStringLiteral("grow"));
+    m_highlightMode->addItem(tr("Underline the word"), QStringLiteral("underline"));
     m_highlightMode->addItem(tr("No highlight"), QStringLiteral("none"));
     m_highlight = colorButton(tr("Highlight color"));
     hf->addRow(tr("Highlight"), m_highlightMode);
@@ -152,13 +161,34 @@ CaptionPanel::CaptionPanel(Project* project, QWidget* parent)
     m_animation = new QComboBox(layoutBox);
     m_animation->addItem(tr("Pop in"), QStringLiteral("pop"));
     m_animation->addItem(tr("Fade"), QStringLiteral("fade"));
+    m_animation->addItem(tr("Slide up"), QStringLiteral("slide"));
+    m_animation->addItem(tr("Bounce"), QStringLiteral("bounce"));
+    m_animation->addItem(tr("Zoom"), QStringLiteral("zoom"));
+    m_animation->addItem(tr("Words appear as spoken"), QStringLiteral("reveal"));
+    m_animation->addItem(tr("Typewriter"), QStringLiteral("typewriter"));
     m_animation->addItem(tr("None"), QStringLiteral("none"));
     pf->addRow(tr("Position"), m_position);
     pf->addRow(tr("Distance from edge"), m_offset);
     pf->addRow(tr("Words at a time"), m_words);
     pf->addRow(tr("Max lines"), m_lines);
     pf->addRow(tr("Animation"), m_animation);
+    m_delay = new QDoubleSpinBox(layoutBox);
+    m_delay->setRange(-30.0, 30.0);
+    m_delay->setSingleStep(0.05);
+    m_delay->setDecimals(2);
+    m_delay->setSuffix(tr(" s"));
+    m_delay->setToolTip(tr("Captions out of sync? Move all of them later (+) or earlier (-)"));
+    pf->addRow(tr("Sync delay"), m_delay);
     v->addWidget(layoutBox);
+
+    auto* langBox = new QGroupBox(tr("Language"), body);
+    auto* gf = new QFormLayout(langBox);
+    m_capLanguage = new QComboBox(langBox);
+    m_capLanguage->setToolTip(tr("Show a translation (Transcript panel > Translate...) instead of the transcript"));
+    m_bilingual = new QCheckBox(tr("Bilingual: the original line under the translation"), langBox);
+    gf->addRow(tr("Show"), m_capLanguage);
+    gf->addRow(QString(), m_bilingual);
+    v->addWidget(langBox);
     v->addStretch(1);
     scroll->setWidget(body);
     outer->addWidget(scroll, 1);
@@ -169,11 +199,12 @@ CaptionPanel::CaptionPanel(Project* project, QWidget* parent)
     outer->addWidget(m_status);
 
     // Wire every control to apply()
-    for (QCheckBox* c : {m_enabled, m_bold, m_italic, m_upper, m_shadow, m_box})
+    for (QCheckBox* c : {m_enabled, m_bold, m_italic, m_upper, m_shadow, m_box, m_bilingual})
         connect(c, &QCheckBox::toggled, this, &CaptionPanel::apply);
     for (QSlider* s : {m_size, m_outlineWidth, m_boxOpacity, m_offset})
         connect(s, &QSlider::valueChanged, this, &CaptionPanel::apply);
-    for (QComboBox* c : {m_highlightMode, m_position, m_animation})
+    connect(m_delay, &QDoubleSpinBox::valueChanged, this, &CaptionPanel::apply);
+    for (QComboBox* c : {m_highlightMode, m_position, m_animation, m_capLanguage})
         connect(c, &QComboBox::currentIndexChanged, this, &CaptionPanel::apply);
     for (QSpinBox* s : {m_words, m_lines}) connect(s, &QSpinBox::valueChanged, this, &CaptionPanel::apply);
     connect(m_font, &QFontComboBox::currentFontChanged, this, [this](const QFont& f) {
@@ -297,6 +328,15 @@ void CaptionPanel::load()
     m_words->setValue(s.wordsPerCaption);
     m_lines->setValue(s.maxLines);
     m_animation->setCurrentIndex(std::max(0, m_animation->findData(s.animation)));
+    m_delay->setValue(s.delay);
+    m_capLanguage->clear();
+    m_capLanguage->addItem(tr("The transcript"), QString());
+    for (const QString& l : m_project->translationLanguages()) m_capLanguage->addItem(tr("%1 translation").arg(languageName(l)), l);
+    if (!s.language.isEmpty() && m_capLanguage->findData(s.language) < 0)
+        m_capLanguage->addItem(tr("%1 (not translated yet)").arg(languageName(s.language)), s.language);
+    m_capLanguage->setCurrentIndex(std::max(0, m_capLanguage->findData(s.language)));
+    m_bilingual->setChecked(s.bilingual);
+    m_bilingual->setEnabled(!s.language.isEmpty());
     m_loading = false;
 
     const int n = int(m_project->captionChunks().size());
@@ -332,6 +372,9 @@ void CaptionPanel::apply()
     s.wordsPerCaption = m_words->value();
     s.maxLines = m_lines->value();
     s.animation = m_animation->currentData().toString();
+    s.delay = m_delay->value();
+    s.language = m_capLanguage->currentData().toString();
+    s.bilingual = m_bilingual->isChecked();
     m_project->setCaptionStyle(s);
 }
 

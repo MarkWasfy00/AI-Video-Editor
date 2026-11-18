@@ -1,5 +1,6 @@
 #pragma once
 
+#include "media/AiModels.h"
 #include "api/EditorApi.h"
 #include "render/PreviewView.h"
 
@@ -24,6 +25,8 @@ namespace ve {
 class ClaudePanel;
 class TranscriptPanel;
 class CaptionPanel;
+class TextPanel;
+class PreviewInteractor;
 class Inspector;
 class McpHttpTransport;
 class McpServer;
@@ -106,10 +109,21 @@ private:
     void closeGapsAtPlayhead();
     bool requireSelection(QString* id);
     void separateAudio(const QString& clipId);   // voice / music separation (asks what to keep)
+    void upscaleClip(const QString& clipId);     // AI super-resolution (FlashVSR / Real-ESRGAN)
+    void aiModelsDialog();                       // Tools > AI Models
+    // Before an AI task: if the chosen model is too heavy for this computer, offers the
+    // recommended one. Returns false if the user cancelled.
+    bool checkModelFits(AiTask task);
     void transcribeClip(const QString& clipId, const QString& language = QStringLiteral("auto"), bool isolateVoice = true,
                         const QString& hints = {});
     void exportTranscript(const QString& format);
     void autoCaptions();                       // transcribe the selected clip + show captions
+    // Text overlays, subtitles and speech
+    void addText(const QString& templateId);   // at the playhead, selected afterwards
+    void speakText(const QString& clipId);     // text to speech (a text clip's words, or typed)
+    void voiceOverSubtitles();                 // speak every subtitle line (dubbing)
+    void importSubtitles();
+    void translateSubtitles();
     void updateLinkActions();
     void addMediaAtPlayhead(const QString& mediaId);
     void removeSelectedMedia();
@@ -121,6 +135,7 @@ private:
     void updateStatus();
     void addRecent(const QString& path);
     void rebuildRecentMenu();
+    void rebuildAiSwitchMenu();                  // Tools > Switch AI Model (downloaded models)
 
     Project* m_project = nullptr;
     PreviewEngine* m_engine = nullptr;
@@ -145,6 +160,9 @@ private:
     QDockWidget* m_transcriptDock = nullptr;
     CaptionPanel* m_captionPanel = nullptr;
     QDockWidget* m_captionDock = nullptr;
+    TextPanel* m_textPanel = nullptr;
+    PreviewInteractor* m_interactor = nullptr;
+    QDockWidget* m_textDock = nullptr;
     MixLevels m_lastLevels;            // latest meter block (for mixer_get)
     QHash<QString, std::shared_ptr<const std::vector<float>>> m_waveCache; // by file path
     QSet<QString> m_wavePending;
@@ -168,6 +186,7 @@ private:
     QAction* m_actOpenGL = nullptr;
     QAction* m_actVulkan = nullptr;
     QMenu* m_recentMenu = nullptr;
+    QMenu* m_aiSwitchMenu = nullptr;
 };
 
 } // namespace ve

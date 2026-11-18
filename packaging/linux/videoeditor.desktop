@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AI Video Editor
+Comment=Video editor with AI transcription, captions, voice separation and Claude
+Exec=VideoEditor %F
+Icon=videoeditor
+Categories=AudioVideo;Video;AudioVideoEditing;
+Terminal=false

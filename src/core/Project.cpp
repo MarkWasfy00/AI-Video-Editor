@@ -240,7 +240,127 @@ double Clip::fadeFactor(TimeUs t) const
     return std::clamp(f, 0.0, 1.0);
 }
 
+// ---------------------------------------------------------------------------
+// Text overlays
+// ---------------------------------------------------------------------------
+namespace {
+QString argb(const QColor& c) { return c.name(QColor::HexArgb); }
+QColor colorVal(const QJsonObject& o, const char* k, const QColor& def)
+{
+    const QColor c(o.value(QLatin1String(k)).toString());
+    return c.isValid() ? c : def;
+}
+QString oneOf(const QJsonObject& o, const char* k, const QStringList& allowed, const QString& def)
+{
+    const QString v = o.value(QLatin1String(k)).toString(def);
+    return allowed.contains(v) ? v : def;
+}
+} // namespace
+
+QJsonObject TextStyle::toJson() const
+{
+    return {{"font", font}, {"fontFile", fontFile}, {"bold", bold}, {"italic", italic}, {"underline", underline},
+            {"uppercase", uppercase}, {"size", size}, {"color", argb(color)}, {"gradient", gradient},
+            {"color2", argb(color2)}, {"align", align}, {"letterSpacing", letterSpacing}, {"lineSpacing", lineSpacing},
+            {"maxWidth", maxWidth}, {"outline", argb(outline)}, {"outlineWidth", outlineWidth}, {"shadow", shadow},
+            {"shadowColor", argb(shadowColor)}, {"shadowX", shadowX}, {"shadowY", shadowY}, {"shadowBlur", shadowBlur},
+            {"background", background}, {"backgroundColor", argb(backgroundColor)},
+            {"backgroundOpacity", backgroundOpacity}, {"backgroundPadding", backgroundPadding},
+            {"backgroundRadius", backgroundRadius}, {"backgroundMode", backgroundMode}};
+}
+
+TextStyle TextStyle::fromJson(const QJsonObject& o) { return fromJson(o, TextStyle{}); }
+
+TextStyle TextStyle::fromJson(const QJsonObject& o, const TextStyle& b)
+{
+    TextStyle s = b;
+    s.font = o.value("font").toString(b.font);
+    s.fontFile = o.value("fontFile").toString(b.fontFile);
+    s.bold = o.value("bold").toBool(b.bold);
+    s.italic = o.value("italic").toBool(b.italic);
+    s.underline = o.value("underline").toBool(b.underline);
+    s.uppercase = o.value("uppercase").toBool(b.uppercase);
+    s.size = std::clamp(num(o, "size", b.size), 0.01, 0.6);
+    s.color = colorVal(o, "color", b.color);
+    s.gradient = o.value("gradient").toBool(b.gradient);
+    s.color2 = colorVal(o, "color2", b.color2);
+    s.align = oneOf(o, "align", {"left", "center", "right"}, b.align);
+    s.letterSpacing = std::clamp(num(o, "letterSpacing", b.letterSpacing), -0.2, 1.5);
+    s.lineSpacing = std::clamp(num(o, "lineSpacing", b.lineSpacing), 0.6, 3.0);
+    s.maxWidth = std::clamp(num(o, "maxWidth", b.maxWidth), 0.1, 1.0);
+    s.outline = colorVal(o, "outline", b.outline);
+    s.outlineWidth = std::clamp(num(o, "outlineWidth", b.outlineWidth), 0.0, 0.5);
+    s.shadow = o.value("shadow").toBool(b.shadow);
+    s.shadowColor = colorVal(o, "shadowColor", b.shadowColor);
+    s.shadowX = std::clamp(num(o, "shadowX", b.shadowX), -1.0, 1.0);
+    s.shadowY = std::clamp(num(o, "shadowY", b.shadowY), -1.0, 1.0);
+    s.shadowBlur = std::clamp(num(o, "shadowBlur", b.shadowBlur), 0.0, 1.0);
+    s.background = o.value("background").toBool(b.background);
+    s.backgroundColor = colorVal(o, "backgroundColor", b.backgroundColor);
+    s.backgroundOpacity = std::clamp(num(o, "backgroundOpacity", b.backgroundOpacity), 0.0, 1.0);
+    s.backgroundPadding = std::clamp(num(o, "backgroundPadding", b.backgroundPadding), 0.0, 2.0);
+    s.backgroundRadius = std::clamp(num(o, "backgroundRadius", b.backgroundRadius), 0.0, 2.0);
+    s.backgroundMode = oneOf(o, "backgroundMode", {"block", "lines"}, b.backgroundMode);
+    return s;
+}
+
+QStringList textAnimationsIn()
+{
+    return {"none", "fade", "pop", "zoom", "slide-up", "slide-down", "slide-left", "slide-right",
+            "typewriter", "words", "blur", "bounce", "drop", "spin"};
+}
+
+QStringList textAnimationsOut()
+{
+    return {"none", "fade", "pop", "zoom", "slide-up", "slide-down", "slide-left", "slide-right",
+            "typewriter", "blur", "spin"};
+}
+
+QStringList textAnimationsLoop() { return {"none", "pulse", "float", "wiggle", "blink", "shake", "rainbow"}; }
+
+QJsonObject TextAnimation::toJson() const
+{
+    return {{"in", in}, {"inDuration", inDuration}, {"out", out}, {"outDuration", outDuration},
+            {"loop", loop}, {"loopSpeed", loopSpeed}};
+}
+
+TextAnimation TextAnimation::fromJson(const QJsonObject& o) { return fromJson(o, TextAnimation{}); }
+
+TextAnimation TextAnimation::fromJson(const QJsonObject& o, const TextAnimation& b)
+{
+    TextAnimation a = b;
+    a.in = oneOf(o, "in", textAnimationsIn(), b.in);
+    a.inDuration = std::clamp(num(o, "inDuration", b.inDuration), 0.0, 10.0);
+    a.out = oneOf(o, "out", textAnimationsOut(), b.out);
+    a.outDuration = std::clamp(num(o, "outDuration", b.outDuration), 0.0, 10.0);
+    a.loop = oneOf(o, "loop", textAnimationsLoop(), b.loop);
+    a.loopSpeed = std::clamp(num(o, "loopSpeed", b.loopSpeed), 0.05, 10.0);
+    return a;
+}
+
+QJsonObject TextData::toJson() const
+{
+    return {{"text", text}, {"style", style.toJson()}, {"animation", animation.toJson()}, {"templateId", templateId}};
+}
+
+TextData TextData::fromJson(const QJsonObject& o)
+{
+    TextData d;
+    d.text = o.value("text").toString();
+    d.style = TextStyle::fromJson(o.value("style").toObject());
+    d.animation = TextAnimation::fromJson(o.value("animation").toObject());
+    d.templateId = o.value("templateId").toString();
+    return d;
+}
+
 QJsonObject Clip::toJson() const
+{
+    QJsonObject o = toJsonBase();
+    if (text) o["text"] = text->toJson();
+    return o;
+}
+
+QJsonObject Clip::toJsonBase() const
 {
     return {
         {"id", id}, {"mediaId", mediaId}, {"name", name},
@@ -289,6 +409,14 @@ Clip Clip::fromJson(const QJsonObject& o)
     c.curvePreset = o.value("curvePreset").toString();
     c.reverse = o.value("reverse").toBool();
     c.freeze = o.value("freeze").toBool();
+    if (o.value("text").isObject()) {
+        c.text = TextData::fromJson(o.value("text").toObject());
+        c.mediaId.clear();
+        c.in = 0;
+        c.speed = 1.0;
+        c.speedCurve.clear();
+        c.reverse = c.freeze = false;
+    }
     return c;
 }
 
@@ -476,6 +604,11 @@ QJsonObject Transcript::toJson() const
             words.append(QJsonArray{double(w.start), double(w.end), w.text});
         QJsonObject o{{"start", double(s.start)}, {"end", double(s.end)}, {"text", s.text}, {"words", words}};
         if (s.edited) o["edited"] = true;
+        if (!s.translations.isEmpty()) {
+            QJsonObject tr;
+            for (auto it = s.translations.begin(); it != s.translations.end(); ++it) tr[it.key()] = it.value();
+            o["translations"] = tr;
+        }
         segs.append(o);
     }
     return {{"mediaId", mediaId}, {"language", language}, {"model", model}, {"segments", segs}};
@@ -494,6 +627,8 @@ Transcript Transcript::fromJson(const QJsonObject& o)
         s.end = timeVal(so, "end");
         s.text = so.value("text").toString();
         s.edited = so.value("edited").toBool();
+        const QJsonObject tr = so.value("translations").toObject();
+        for (auto it = tr.begin(); it != tr.end(); ++it) s.translations.insert(it.key(), it.value().toString());
         for (const auto& wv : so.value("words").toArray()) {
             const QJsonArray w = wv.toArray();
             if (w.size() == 3) s.words.push_back({TimeUs(w[0].toDouble()), TimeUs(w[1].toDouble()), w[2].toString()});
@@ -579,7 +714,165 @@ int Project::insertTranscriptSegment(const QString& mediaId, TimeUs start, TimeU
     return index;
 }
 
-std::vector<TimelineLine> Project::transcriptLines() const
+bool Project::shiftTranscript(const QString& mediaId, TimeUs delta, int from, int to)
+{
+    auto it = m_transcripts.find(mediaId);
+    if (it == m_transcripts.end() || it->segments.empty()) return false;
+    const int n = int(it->segments.size());
+    if (to < 0 || to >= n) to = n - 1;
+    from = std::max(0, from);
+    if (from > to) return false;
+    // Never before the start of the media.
+    delta = std::max(delta, -it->segments[size_t(from)].start);
+    for (int i = from; i <= to; ++i) {
+        auto& s = it->segments[size_t(i)];
+        s.start += delta;
+        s.end += delta;
+        for (auto& w : s.words) {
+            w.start += delta;
+            w.end += delta;
+        }
+    }
+    std::stable_sort(it->segments.begin(), it->segments.end(), [](const auto& a, const auto& b) { return a.start < b.start; });
+    setModified(true);
+    emit transcriptsChanged();
+    return true;
+}
+
+namespace {
+// Splits text into two parts at the word nearest to fraction u (0..1).
+std::pair<QString, QString> splitWordsAt(const QString& text, double u)
+{
+    const QStringList parts = text.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+    if (parts.size() < 2) return {text, QString()};
+    const int k = std::clamp(int(std::lround(u * parts.size())), 1, int(parts.size()) - 1);
+    return {parts.mid(0, k).join(QLatin1Char(' ')), parts.mid(k).join(QLatin1Char(' '))};
+}
+} // namespace
+
+int Project::splitTranscriptSegment(const QString& mediaId, int index, TimeUs at)
+{
+    auto it = m_transcripts.find(mediaId);
+    if (it == m_transcripts.end() || index < 0 || index >= int(it->segments.size())) return -1;
+    TranscriptSegment& s = it->segments[size_t(index)];
+    if (at <= s.start || at >= s.end) return -1;
+    TranscriptSegment right;
+    right.end = s.end;
+    right.edited = true;
+    if (!s.words.empty()) {
+        // Between the words: everything starting before `at` stays on the left.
+        size_t k = 0;
+        while (k < s.words.size() && s.words[k].start + (s.words[k].end - s.words[k].start) / 2 < at) ++k;
+        if (k == 0 || k == s.words.size()) return -1;
+        right.words.assign(s.words.begin() + qsizetype(k), s.words.end());
+        s.words.erase(s.words.begin() + qsizetype(k), s.words.end());
+        QStringList l, r;
+        for (const auto& w : s.words) l << w.text;
+        for (const auto& w : right.words) r << w.text;
+        s.text = l.join(QLatin1Char(' '));
+        right.text = r.join(QLatin1Char(' '));
+        right.start = right.words.front().start;
+        s.end = std::max(s.words.back().end, s.start + 1);
+    } else {
+        const double u = double(at - s.start) / double(std::max<TimeUs>(1, s.end - s.start));
+        auto [l, r] = splitWordsAt(s.text, u);
+        if (r.isEmpty()) return -1;
+        s.text = l;
+        right.text = r;
+        right.start = at;
+        s.end = at;
+    }
+    const double u = double(right.start - s.start) / double(std::max<TimeUs>(1, right.end - s.start));
+    for (auto t = s.translations.begin(); t != s.translations.end(); ++t) {
+        auto [l, r] = splitWordsAt(t.value(), u);
+        t.value() = l;
+        right.translations.insert(t.key(), r);
+    }
+    s.edited = true;
+    it->segments.insert(it->segments.begin() + index + 1, std::move(right));
+    setModified(true);
+    emit transcriptsChanged();
+    return index + 1;
+}
+
+bool Project::mergeTranscriptSegments(const QString& mediaId, int index)
+{
+    auto it = m_transcripts.find(mediaId);
+    if (it == m_transcripts.end() || index < 0 || index + 1 >= int(it->segments.size())) return false;
+    TranscriptSegment& a = it->segments[size_t(index)];
+    const TranscriptSegment b = it->segments[size_t(index) + 1];
+    const bool keepWords = !a.words.empty() && !b.words.empty();
+    a.text = (a.text + QLatin1Char(' ') + b.text).trimmed();
+    a.end = std::max(a.end, b.end);
+    if (keepWords) a.words.insert(a.words.end(), b.words.begin(), b.words.end());
+    else a.words.clear();
+    for (auto t = b.translations.begin(); t != b.translations.end(); ++t)
+        a.translations[t.key()] = (a.translations.value(t.key()) + QLatin1Char(' ') + t.value()).trimmed();
+    a.edited = true;
+    it->segments.erase(it->segments.begin() + index + 1);
+    setModified(true);
+    emit transcriptsChanged();
+    return true;
+}
+
+bool Project::setTranscriptTranslation(const QString& mediaId, const QString& language, const QStringList& texts)
+{
+    auto it = m_transcripts.find(mediaId);
+    if (it == m_transcripts.end() || language.isEmpty() || texts.size() != qsizetype(it->segments.size())) return false;
+    for (size_t i = 0; i < it->segments.size(); ++i) {
+        const QString t = texts[qsizetype(i)].trimmed();
+        if (t.isEmpty()) it->segments[i].translations.remove(language);
+        else it->segments[i].translations.insert(language, t);
+    }
+    setModified(true);
+    emit transcriptsChanged();
+    return true;
+}
+
+bool Project::setSegmentTranslation(const QString& mediaId, int index, const QString& language, const QString& text)
+{
+    auto it = m_transcripts.find(mediaId);
+    if (it == m_transcripts.end() || index < 0 || index >= int(it->segments.size()) || language.isEmpty()) return false;
+    auto& tr = it->segments[size_t(index)].translations;
+    if (text.trimmed().isEmpty()) tr.remove(language);
+    else tr.insert(language, text.trimmed());
+    setModified(true);
+    emit transcriptsChanged();
+    return true;
+}
+
+QStringList Project::translationLanguages() const
+{
+    QStringList out;
+    for (const auto& t : m_transcripts)
+        for (const auto& s : t.segments)
+            for (auto it = s.translations.begin(); it != s.translations.end(); ++it)
+                if (!out.contains(it.key())) out << it.key();
+    out.sort();
+    return out;
+}
+
+QList<QPair<QString, QString>> subtitleLanguages()
+{
+    return {{"en", "English"},     {"ar-EG", "Arabic (Egyptian)"}, {"ar", "Arabic (Standard)"},
+            {"es", "Spanish"},     {"fr", "French"},               {"de", "German"},
+            {"it", "Italian"},     {"pt", "Portuguese"},           {"ru", "Russian"},
+            {"tr", "Turkish"},     {"hi", "Hindi"},                {"ur", "Urdu"},
+            {"fa", "Persian"},     {"id", "Indonesian"},           {"nl", "Dutch"},
+            {"pl", "Polish"},      {"uk", "Ukrainian"},            {"ja", "Japanese"},
+            {"ko", "Korean"},      {"zh", "Chinese"},              {"he", "Hebrew"},
+            {"sv", "Swedish"},     {"el", "Greek"},                {"vi", "Vietnamese"},
+            {"th", "Thai"},        {"bn", "Bengali"},              {"sw", "Swahili"}};
+}
+
+QString languageName(const QString& code)
+{
+    for (const auto& [c, n] : subtitleLanguages())
+        if (c == code) return n;
+    return code;
+}
+
+std::vector<TimelineLine> Project::transcriptLines(const QString& language) const
 {
     std::vector<TimelineLine> out;
     for (const auto& track : m_tracks) {
@@ -595,7 +888,12 @@ std::vector<TimelineLine> Project::transcriptLines() const
                 TimeUs b = c.timelineTimeOf(std::clamp(seg.end, s0, s1));
                 if (a < 0 || b < 0) continue;
                 if (b < a) std::swap(a, b);                           // reversed clip
-                TimelineLine line{c.id, c.mediaId, i, a, b, seg.text, {}};
+                TimelineLine line{c.id, c.mediaId, i, a, b, seg.text, {}, seg.text};
+                if (!language.isEmpty() && seg.translations.contains(language)) {
+                    line.text = seg.translations.value(language);    // no word timings for a translation
+                    out.push_back(std::move(line));
+                    continue;
+                }
                 for (const auto& w : seg.words) {
                     if (w.end <= s0 || w.start >= s1) continue;
                     TimeUs wa = c.timelineTimeOf(std::clamp(w.start, s0, s1));
@@ -623,7 +921,8 @@ QJsonObject CaptionStyle::toJson() const
             {"outline", outline.name(QColor::HexArgb)}, {"outlineWidth", outlineWidth}, {"shadow", shadow},
             {"box", box}, {"boxColor", boxColor.name(QColor::HexArgb)}, {"boxOpacity", boxOpacity},
             {"position", position}, {"offset", offset}, {"wordsPerCaption", wordsPerCaption},
-            {"maxLines", maxLines}, {"animation", animation}};
+            {"maxLines", maxLines}, {"animation", animation}, {"language", language}, {"bilingual", bilingual},
+            {"delay", delay}};
 }
 
 CaptionStyle CaptionStyle::fromJson(const QJsonObject& o)
@@ -645,7 +944,7 @@ CaptionStyle CaptionStyle::fromJson(const QJsonObject& o)
     s.size = std::clamp(num(o, "size", s.size), 0.015, 0.3);
     s.color = color("color", s.color);
     s.highlight = color("highlight", s.highlight);
-    s.highlightMode = o.value("highlightMode").toString(s.highlightMode);
+    s.highlightMode = oneOf(o, "highlightMode", captionHighlightModes(), s.highlightMode);
     s.outline = color("outline", s.outline);
     s.outlineWidth = std::clamp(num(o, "outlineWidth", s.outlineWidth), 0.0, 0.5);
     s.shadow = o.value("shadow").toBool(s.shadow);
@@ -656,14 +955,21 @@ CaptionStyle CaptionStyle::fromJson(const QJsonObject& o)
     s.offset = std::clamp(num(o, "offset", s.offset), 0.0, 0.45);
     s.wordsPerCaption = std::clamp(o.value("wordsPerCaption").toInt(s.wordsPerCaption), 0, 20);
     s.maxLines = std::clamp(o.value("maxLines").toInt(s.maxLines), 1, 4);
-    s.animation = o.value("animation").toString(s.animation);
+    s.animation = oneOf(o, "animation", captionAnimations(), s.animation);
+    s.language = o.value("language").toString();
+    s.bilingual = o.value("bilingual").toBool();
+    s.delay = std::clamp(num(o, "delay", 0.0), -30.0, 30.0);
     return s;
 }
+
+QStringList captionHighlightModes() { return {"color", "box", "karaoke", "spoken", "grow", "underline", "none"}; }
+QStringList captionAnimations() { return {"pop", "fade", "slide", "bounce", "zoom", "reveal", "typewriter", "none"}; }
 
 QStringList captionPresetNames()
 {
     return {QStringLiteral("classic"), QStringLiteral("bold"), QStringLiteral("box"), QStringLiteral("neon"),
-            QStringLiteral("minimal"), QStringLiteral("karaoke"), QStringLiteral("arabic")};
+            QStringLiteral("minimal"), QStringLiteral("karaoke"), QStringLiteral("arabic"), QStringLiteral("sweep"),
+            QStringLiteral("wordpop"), QStringLiteral("typewriter"), QStringLiteral("cinema")};
 }
 
 CaptionStyle captionPreset(const QString& name, const CaptionStyle& base)
@@ -673,6 +979,9 @@ CaptionStyle captionPreset(const QString& name, const CaptionStyle& base)
     s.fontFile.clear();
     s.arabicFont = base.arabicFont;           // the chosen Arabic face survives preset changes
     s.arabicFontFile = base.arabicFontFile;
+    s.language = base.language;               // so are the language and timing
+    s.bilingual = base.bilingual;
+    s.delay = base.delay;
     s.preset = name;
     if (name == QLatin1String("bold")) {     // the viral look: big caps, thick outline
         s.font = QStringLiteral("Arial Black");
@@ -723,6 +1032,44 @@ CaptionStyle captionPreset(const QString& name, const CaptionStyle& base)
         s.highlight = QColor(130, 70, 255);
         s.outlineWidth = 0.08;
         s.wordsPerCaption = 5;
+    } else if (name == QLatin1String("sweep")) {     // karaoke: colour sweeps through each word as it is sung
+        s.font = QStringLiteral("Segoe UI Black");
+        s.highlightMode = QStringLiteral("karaoke");
+        s.highlight = QColor(60, 200, 255);
+        s.outlineWidth = 0.12;
+        s.wordsPerCaption = 0;
+        s.maxLines = 2;
+        s.animation = QStringLiteral("fade");
+    } else if (name == QLatin1String("wordpop")) {   // words pop in one by one, the spoken one bigger
+        s.font = QStringLiteral("Arial Black");
+        s.uppercase = true;
+        s.size = 0.07;
+        s.highlightMode = QStringLiteral("grow");
+        s.highlight = QColor(120, 255, 90);
+        s.outlineWidth = 0.2;
+        s.wordsPerCaption = 4;
+        s.position = QStringLiteral("middle");
+        s.offset = 0.08;
+        s.animation = QStringLiteral("reveal");
+    } else if (name == QLatin1String("typewriter")) {
+        s.font = QStringLiteral("Consolas");
+        s.bold = false;
+        s.box = true;
+        s.boxOpacity = 0.75;
+        s.outlineWidth = 0.0;
+        s.shadow = false;
+        s.highlightMode = QStringLiteral("none");
+        s.wordsPerCaption = 6;
+        s.animation = QStringLiteral("typewriter");
+    } else if (name == QLatin1String("cinema")) {    // film subtitles: whole line, plain, soft shadow
+        s.font = QStringLiteral("Segoe UI Semibold");
+        s.bold = false;
+        s.size = 0.048;
+        s.outlineWidth = 0.06;
+        s.highlightMode = QStringLiteral("none");
+        s.wordsPerCaption = 0;
+        s.offset = 0.07;
+        s.animation = QStringLiteral("none");
     } else {
         s.preset = QStringLiteral("classic");
     }
@@ -740,8 +1087,10 @@ void Project::setCaptionStyle(const CaptionStyle& s)
 std::vector<CaptionChunk> Project::captionChunks() const
 {
     std::vector<CaptionChunk> out;
-    const auto lines = transcriptLines();
-    const int per = m_captions.wordsPerCaption;
+    const auto lines = transcriptLines(m_captions.language);
+    // Bilingual captions show whole lines (the original under its translation).
+    const bool bilingual = m_captions.bilingual && !m_captions.language.isEmpty();
+    const int per = bilingual ? 0 : m_captions.wordsPerCaption;
     for (size_t li = 0; li < lines.size(); ++li) {
         const TimelineLine& l = lines[li];
         // Words with times: from Whisper, or spread evenly over an edited line.
@@ -759,6 +1108,7 @@ std::vector<CaptionChunk> Project::captionChunks() const
             if (cur.words.empty()) return;
             cur.start = cur.words.front().start;
             cur.end = cur.words.back().end;
+            if (bilingual && l.original != l.text) cur.secondary = l.original;
             out.push_back(cur);
             cur = {};
         };
@@ -783,6 +1133,17 @@ std::vector<CaptionChunk> Project::captionChunks() const
         }
     }
     std::sort(out.begin(), out.end(), [](const CaptionChunk& a, const CaptionChunk& b) { return a.start < b.start; });
+    if (const TimeUs d = secondsToUs(m_captions.delay); d != 0) {   // sync fix for every caption
+        for (auto& c : out) {
+            c.start += d;
+            c.end += d;
+            for (auto& w : c.words) {
+                w.start += d;
+                w.end += d;
+            }
+        }
+        out.erase(std::remove_if(out.begin(), out.end(), [](const CaptionChunk& c) { return c.end <= 0; }), out.end());
+    }
     return out;
 }
 
@@ -1272,6 +1633,26 @@ bool Project::updateClip(const Clip& clip)
     return true;
 }
 
+QString Project::addTextClip(int trackIndex, TimeUs start, TimeUs duration, const TextData& text,
+                             const ClipTransform& transform)
+{
+    Clip c;
+    c.id = newId();
+    c.text = text;
+    const QString first = text.text.section(QChar(u'\n'), 0, 0).trimmed();
+    c.name = first.isEmpty() ? QStringLiteral("Text") : first.left(60);
+    c.start = snapToFrame(std::max<TimeUs>(0, start), m_settings.fps);
+    c.duration = std::max(duration, kMinClipDuration);
+    c.transform = transform;
+    if (trackIndex < 0 || trackIndex >= trackCount() || m_tracks[trackIndex].isAudio()) {
+        // Text goes above the pictures: the top video track if it is free there, else a new one on top.
+        trackIndex = -1;
+        if (firstAudioTrack() > 0 && isTrackFree(0, c.start, c.end())) trackIndex = 0;
+        if (trackIndex < 0) trackIndex = addTrack({}, TrackKind::Video);
+    }
+    return addClip(trackIndex, std::move(c));
+}
+
 TimeUs Project::duration() const
 {
     TimeUs d = 0;
@@ -1370,7 +1751,7 @@ bool Project::trimEdgesSingle(const QString& id, TimeUs ns, TimeUs ne)
     if (ne - ns < kMinClipDuration) ne = ns + kMinClipDuration;
     const TimeUs dl = ns - c->start, dr = ne - c->end(), d = c->duration;
     TimeUs newIn = c->in;
-    if (!c->freeze) {
+    if (!c->freeze && !c->isText()) {          // text has no source: any length either way
         if (!c->reverse) newIn = c->in + c->sourceOffset(dl);                         // source at the new start
         else newIn = c->in + c->sourceSpan() - c->sourceOffset(d + dr);               // source at the new end
         if (newIn < 0) {                     // ran past the start of the source: give the time back
@@ -1429,7 +1810,7 @@ bool Project::setClipSpeed(const QString& id, double speed, const std::vector<Sp
                            const QString& curvePreset, bool linked)
 {
     const Clip* c = findClip(id);
-    if (!c || c->freeze) return false;
+    if (!c || c->freeze || c->isText()) return false;
     speed = std::clamp(speed, 0.05, 16.0);
     const TimeUs oldEnd = c->end();
     const QStringList group = QStringList{id} + (linked ? linkedClips(id) : QStringList());
@@ -1471,7 +1852,7 @@ bool Project::setClipReverse(const QString& id, bool reverse, bool linked)
     if (!findClip(id)) return false;
     const QStringList group = QStringList{id} + (linked ? linkedClips(id) : QStringList());
     for (const QString& g : group)
-        if (Clip* c = findClipMutable(g)) c->reverse = reverse;
+        if (Clip* c = findClipMutable(g); c && !c->isText()) c->reverse = reverse;
     notifyChanged();
     return true;
 }

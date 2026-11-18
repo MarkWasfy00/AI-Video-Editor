@@ -19,6 +19,7 @@ struct Layer {
     ClipTransform transform;
     ClipEffects effects;
     double opacity = 1.0;          // transform opacity * fade envelope
+    QString clipId;                // the clip it shows (empty for captions / overlays)
 };
 
 // Everything a backend needs to draw one output frame (bottom -> top).

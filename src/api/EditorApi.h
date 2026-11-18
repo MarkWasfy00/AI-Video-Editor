@@ -113,6 +113,18 @@ public:
     QJsonObject audioSeparate(const QString& clipId, const QString& keep, bool install);
     QJsonObject audioSeparationStatus() const;
 
+    // AI video upscaling (FlashVSR / Real-ESRGAN) of the part of the source a video
+    // clip shows. model: an upscale model id, empty = the one chosen in AI Models.
+    // scale: 2 or 4 (0 = automatic). replace: put the upscaled file in the clip
+    // (else it is only imported). force: run even if the model is too heavy for
+    // this computer. install: run the one-time setup if needed (downloads).
+    QJsonObject videoUpscale(const QString& clipId, const QString& model, int scale, bool replace, bool install,
+                             bool force = false);
+
+    // --- local AI models: hardware, recommendations, choices
+    QJsonObject aiModels() const;
+    QJsonObject aiModelSelect(const QString& task, const QString& model);
+
     // --- transcripts (Whisper). Segment times in the API are SOURCE seconds of
     // the media; "lines" also give the TIMELINE seconds where they are heard.
     // isolateVoice: transcribe the separated voice (better for songs); "auto"
@@ -121,13 +133,38 @@ public:
                                  bool install, const QString& hints = {});
     QJsonObject transcriptGet(const QString& mediaOrClipId) const;
     QJsonObject transcriptUpdate(const QJsonObject& args);
-    QJsonObject transcriptExport(const QString& path, const QString& format) const;
+    // language: export a translation instead of the transcript ("" = the transcript).
+    QJsonObject transcriptExport(const QString& path, const QString& format, const QString& language = {}) const;
     static QString formatTranscript(const std::vector<TimelineLine>& lines, const QString& format);
+    // Moves subtitle lines in time (seconds, + = later): one media's transcript (or all), lines [from, to].
+    QJsonObject transcriptShift(const QJsonObject& args);
+    // Reads subtitles (.srt / .vtt / .lrc, timeline times) into the transcript of the clip's sound.
+    QJsonObject transcriptImport(const QString& clipId, const QString& path, bool replace);
+    // Translates every transcript on the timeline (or one media's) with NLLB. Stored next to the
+    // transcript; shown as captions when showCaptions (captions language). install = set up if needed.
+    QJsonObject transcriptTranslate(const QString& language, const QString& mediaId, bool install, bool showCaptions);
+    static QJsonArray parseSubtitles(const QString& content, const QString& format, QString* error); // [[start, end, text]] seconds
 
     // --- on-screen captions from the transcript (CapCut-style)
     QJsonObject captionsGet() const;
     QJsonObject captionsSet(const QJsonObject& changes);
     QJsonObject clipUpdate(const QString& id, const QJsonObject& changes);
+
+    // --- text overlays (titles, lower thirds, ...): clips on video tracks
+    QJsonObject textTemplates() const;
+    // text, template, start (default playhead), duration, track, style{}, animation{}, transform{}
+    QJsonObject textAdd(const QJsonObject& args);
+    // text, template (re-style from a template), style{}, animation{}
+    QJsonObject textUpdate(const QString& clipId, const QJsonObject& args);
+    QJsonObject textTemplateSave(const QString& clipId, const QString& name);
+    QJsonObject textTemplateDelete(const QString& id);
+
+    // --- text to speech (voice-over)
+    QJsonObject ttsVoices(const QString& engine) const;
+    // text (or clipId of a text clip), engine, voice, rate, start, track, install. Adds an audio clip.
+    QJsonObject ttsSpeak(const QJsonObject& args);
+    // A voice-over of the subtitles: one clip per line at its time. language: a translation ("" = transcript).
+    QJsonObject ttsSubtitles(const QJsonObject& args);
 
     // --- history
     QJsonObject undo();
@@ -167,6 +204,10 @@ private:
     std::pair<QString, QString> stemFiles(const QString& mediaPath, TimeUs duration, bool* cached, QString* device,
                                           double* seconds);
     QString audioClipFor(const QString& clipId) const;   // the clip itself, or the audio linked to a video clip
+    TextData textDataFrom(const QJsonObject& args, const TextData& base) const;   // validates style / animation
+    // Speech for `text` as a media item (imported once per file). Returns the media id.
+    QString speechMedia(const QString& text, const QString& engine, const QString& voice, double rate, bool install,
+                        bool* cached);
 
     Project* m_project;
     EditorHost* m_host;

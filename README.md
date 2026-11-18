@@ -3,6 +3,15 @@
 A basic non-linear video editor built with **Qt 6 + C++20**, **FFmpeg**, **Vulkan + OpenGL**
 GPU compositing, **CMake + Ninja**, and **SQLite + JSON** project files.
 
+## Download
+
+Get the latest build from [Releases](https://github.com/MarkWasfy00/AI-Video-Editor/releases/latest):
+
+- **Windows (x64):** `VideoEditor-Setup-<version>.exe`. Run it to install.
+- **Linux (x86_64):** `VideoEditor-<version>-x86_64.AppImage`. Run `chmod +x` on it, then
+  start it. Built on Ubuntu 24.04, so it needs glibc 2.39 or newer. A plain
+  `VideoEditor-<version>-linux-x86_64.tar.gz` is also provided; run `./AppRun` inside it.
+
 ## Features
 
 - **Media bin**: import video, audio, and still images (drag & drop or *File > Import*),
@@ -53,6 +62,12 @@ GPU compositing, **CMake + Ninja**, and **SQLite + JSON** project files.
   | Transcript / lyrics | *Clip > Transcribe Speech / Lyrics...* or right-click: Whisper turns speech or singing into timed text in the **Transcript** panel (`Ctrl+Shift+T`) |
   | Captions on the video | *Clip > Auto Captions* (or right-click): CapCut-style text from the transcript, with the spoken word highlighted; style it in the **Captions** panel (`Ctrl+Shift+K`) |
   | Separate voice and music | *Clip > Separate Voice and Music...* or right-click: AI separation (Demucs) puts the voice and the music on separate audio tracks, or keeps only one of them |
+  | Upscale video (AI) | *Clip > Upscale Video (AI)...* (`Ctrl+Alt+U`): FlashVSR or Real-ESRGAN, 2x / 4x |
+  | Text overlays | *Clip > Add Text* (`Ctrl+T`) or the **Text** panel (`Ctrl+Shift+E`): titles, lower thirds, stickers from 16 templates |
+  | Subtitle timing | Start / End columns in the Transcript panel, *Shift Timing*, nudge, split / merge lines, captions *Sync delay* |
+  | Import / translate subtitles | *Clip > Import Subtitles* (.srt / .vtt / .lrc), *Clip > Translate Subtitles* (offline NLLB-200) |
+  | Text to speech | *Clip > Text to Speech* (`Ctrl+Alt+T`), *Clip > Voice-over from Subtitles* (dubbing) |
+  | AI models for this computer | *Tools > AI Models* (recommendations from the hardware), *Tools > Switch AI Model* (downloaded models) |
 
   When a clip's speed changes, it keeps the same footage: its length changes and later clips
   on its tracks move so nothing is overwritten. The audio pitch follows the speed, as on tape
@@ -68,7 +83,44 @@ GPU compositing, **CMake + Ninja**, and **SQLite + JSON** project files.
     `demucs`, plus the model (~80 MB). It lives in `%LOCALAPPDATA%\VideoEditor\separator`.
   - Separated files are cached in `%LOCALAPPDATA%\VideoEditor\separated`, so separating the
     same file again is instant.
-- **Transcripts and lyrics** with OpenAI's open-source **Whisper** (`turbo` model, on the GPU):
+- **AI video upscaling** (*Clip > Upscale Video (AI)...*, `Ctrl+Alt+U`): raises a video clip's
+  resolution 2x or 4x with a local AI model. Only the part of the source the clip shows is
+  processed; the result (H.264 with the original sound) replaces the clip's source with the same
+  timing, and *Undo* brings the original back. The dialog can also raise the project resolution
+  so the export keeps the new detail.
+  - **FlashVSR v1.1** ([OpenImagingLab/FlashVSR](https://github.com/OpenImagingLab/FlashVSR),
+    Apache-2.0): diffusion-based video super-resolution, the sharpest results. *Full*, *Tiny*
+    (smaller decoder) and *Tiny, long video* (streamed, least VRAM). It runs through the
+    low-VRAM implementation of
+    [ComfyUI-FlashVSR_Ultra_Fast](https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast)
+    (GPL-3.0), whose Triton "sparse sage" attention needs no compiled CUDA extension, so it also
+    works on Windows. Needs an NVIDIA RTX GPU (20-series or newer) and 16 GB of RAM; on GPUs
+    under 12-20 GB it runs in tiles (slower). First use downloads about 7 GB of weights.
+  - **Real-ESRGAN** (x4plus, and the compact *General* model) for computers without a suitable
+    GPU: frame by frame, any NVIDIA GPU or the CPU, under 70 MB.
+  - Setup on first use (with `uv`): a private Python 3.12 environment with the PyTorch build that
+    matches the GPU (CUDA 12.8 for RTX 30+, CUDA 12.4 + Triton 3.2 for RTX 20, CPU otherwise) in
+    `%LOCALAPPDATA%\VideoEditor\upscaler`. The FlashVSR code and weights are pinned versions and
+    checked after download. Results are cached in `%LOCALAPPDATA%\VideoEditor\upscaled`.
+- **AI models matched to the computer** (*Tools > AI Models*): every local model (upscaling,
+  transcription, voice/music separation) is listed with what it needs and how it fits this
+  computer (*Runs well*, *Runs slowly*, *Too heavy*, *Not supported*), from the detected RAM,
+  NVIDIA GPU, VRAM and free disk space. The recommended model is marked.
+  - On computers that cannot run the best models well, the editor says so on start-up and offers
+    the recommended models (once per hardware). Starting a task with a model that is too heavy
+    offers the recommended one instead (or *Try anyway*).
+  - | Task | Models (best first) |
+    | --- | --- |
+    | Upscaling | FlashVSR Full, FlashVSR Tiny, FlashVSR Tiny long video, Real-ESRGAN x4plus, Real-ESRGAN General |
+    | Transcription | Whisper large-v3 turbo, Whisper small, Whisper base |
+    | Voice / music | Demucs fine-tuned (`htdemucs_ft`), Demucs (`htdemucs`) |
+  - **Switch between downloaded models** with *Tools > Switch AI Model*: it lists the models
+    already on this computer for each task; one click switches, with no download. *Tools > AI
+    Models* has a *Show only downloaded models* filter too.
+  - Try the prompt as another computer with `VE_SIMULATE_HARDWARE`, e.g.
+    `VE_SIMULATE_HARDWARE=ram=8,gpu=none` or `ram=32,vram=24,cc=8.9,name=RTX 4090`.
+- **Transcripts and lyrics** with OpenAI's open-source **Whisper** (`turbo` by default, or `small` /
+  `base` on smaller computers, see *Tools > AI Models*; on the GPU when possible):
   - Select a clip with speech or singing, then *Transcribe Selected Clip* in the **Transcript**
     panel (or right-click the clip). For songs, *Voice only* separates the voice from the music
     first, which gives much better lyrics.
@@ -109,6 +161,48 @@ GPU compositing, **CMake + Ninja**, and **SQLite + JSON** project files.
   - Edit the words in the Transcript panel and the captions follow. Captions show in the preview
     and are burned into exported video (and `render_frame`). Use *Export > .srt* for separate
     subtitle files.
+  - More looks: **Karaoke sweep** (the colour fills each word as it is sung), **Word pop** (words
+    appear as they are said, the spoken one bigger), **Typewriter** and **Cinema**. Highlight modes:
+    colour, box, karaoke sweep, every word said so far, bigger word, underline. Animations: pop,
+    fade, slide up, bounce, zoom, words-as-spoken, typewriter.
+- **Subtitle editing and timing** (Transcript panel):
+  - Double-click a line's *Start* / *End* to type a new time (`m:ss.cc`), or right-click a line:
+    *Set Start / End to Playhead*, *Nudge Earlier / Later* (0.1 s), *Shift This and Later Lines*,
+    *Split at Playhead*, *Merge with Next Line*.
+  - *Shift Timing...* moves every line; the Captions panel's *Sync delay* moves only the on-screen
+    captions.
+  - *Import Subtitles...* reads `.srt`, `.vtt` or `.lrc` (timeline times) into the selected clip's
+    transcript, to edit, style, translate or voice them.
+- **Subtitle translation** (*Translate...* in the Transcript panel, *Clip > Translate Subtitles*): Meta's
+  **NLLB-200** model on this computer (GPU when possible), 27 languages including Egyptian Arabic.
+  The translation is kept next to each line (a *Translation* column you can edit) and is exported
+  with *Export* or shown as captions (Captions panel > *Language*), optionally **bilingual** with the
+  original line under it. The first use downloads `transformers` and the model (600M, ~2.5 GB; the
+  1.3B model is in *Tools > AI Models*).
+- **Text overlays** (the **Text** panel): a template gallery (Title, Subtitle, Cinematic, Gradient,
+  Quote, Arabic title, Lower third, Breaking news, Highlight box, Subscribe, Viral caption, Wiggle
+  sticker, Neon, Hollow outline, Typewriter, Rainbow) plus your own (*Save as Template...*).
+  - Text clips sit on video tracks (purple in the timeline): move, trim, split, duplicate and undo
+    like any clip; position, scale, rotation and opacity are in the Inspector.
+  - **Move it right in the preview** (works for videos and images too): click to select (gold
+    outline), drag to move (snaps to the centre; hold `Ctrl` to place freely), drag a corner to
+    resize, `Alt`+drag to rotate (snaps to 45°), mouse wheel to scale, `Shift`+wheel to rotate,
+    double-click text to edit its words. Each drag is one undo step. (Paused only: while playing,
+    clicks are ignored.)
+  - Typography: any installed font or a `.ttf` / `.otf` file, size, bold / italic / underline / caps,
+    colour or vertical gradient, alignment, letter and line spacing, wrap width. Arabic runs right
+    to left.
+  - Outline, soft shadow or glow (colour, distance, softness), background box (one box or one per
+    line, colour, opacity, padding, rounded corners).
+  - Animations: in (fade, pop, zoom, slide up / down / left / right, typewriter, word by word, blur,
+    bounce, drop, spin), out (the same, typewriter erases) and loops (pulse, float, wiggle, blink,
+    shake, rainbow), each with its own duration / speed.
+- **Text to speech** (*Clip > Text to Speech*, *Read Aloud* in the Text panel): adds a voice-over
+  clip. Engines: **Windows voices** (offline, nothing to install), **Piper** neural voices (offline,
+  ~60 MB per voice) and **Microsoft Edge** neural voices (online: the text is sent to Microsoft;
+  includes Egyptian Arabic voices Salma and Shakir). *Voice-over from Subtitles* speaks every line
+  at its time on a *Voice-over* track, from the transcript or a translation (dubbing), and can turn
+  the original speech down. Speech is cached in `%LOCALAPPDATA%\VideoEditor\tts`.
 - **GPU preview** with two backends you can switch at runtime (*View > Preview Renderer*):
   - **OpenGL 3.3 core** (`QOpenGLWidget`)
   - **Vulkan** (`QVulkanWindow`, with SPIR-V compiled at build time by `glslc`)
@@ -176,7 +270,7 @@ tests use that same code. Two transports are available:
 | **GUI app** (live) | `http://127.0.0.1:8765/mcp` (Streamable HTTP, localhost only) | Watching Claude edit in the window. Toggle under *Tools > Enable MCP Server*; `--mcp-port N` / `--no-mcp` on the command line. |
 | **Headless** | `VideoEditorMCP.exe` (stdio) or `VideoEditorMCP --http 8765` | Automation and CI. No window; the SDK launches it for you. |
 
-### Tools (56)
+### Tools (70)
 
 | Area | Tools |
 | --- | --- |
@@ -184,7 +278,9 @@ tests use that same code. Two transports are available:
 | Media | `media_import`, `media_list`, `media_remove`, `media_probe` |
 | Tracks | `track_list`, `track_add`, `track_remove`, `track_update` |
 | Audio mixer | `mixer_get` (faders, pan, mute/solo, master, live meters while playing), `mixer_set_track`, `mixer_set_master`, `mixer_analyze` (offline peak/RMS per track and master, clipping count, gain advice) |
-| Audio AI | `audio_separate` (voice / music separation; `keep`: both, voice, music), `transcript_create` (Whisper speech / lyrics with word timings; `language: "ar-EG"` for Egyptian Arabic, `hints`), `transcript_get`, `transcript_update` (fix text or timing, insert, delete), `transcript_export` (srt, vtt, lrc, txt), `captions_get`, `captions_set` (CapCut-style captions: preset, font or `fontFile`, `arabicFont` / `arabicFontFile`, colours, position, words per caption, animation) |
+| Video AI | `video_upscale` (FlashVSR / Real-ESRGAN super-resolution, 2x / 4x, replaces the clip's source), `ai_models` (hardware, every local model with its fit and the recommendation), `ai_model_select` (a model id or `recommended`) |
+| Audio AI | `audio_separate` (voice / music separation; `keep`: both, voice, music), `transcript_create` (Whisper speech / lyrics with word timings; `language: "ar-EG"` for Egyptian Arabic, `hints`), `transcript_get`, `transcript_update` (fix text or timing, insert, delete), `transcript_export` (srt, vtt, lrc, txt), `captions_get`, `captions_set` (CapCut-style captions: preset, font or `fontFile`, `arabicFont` / `arabicFontFile`, colours, position, words per caption, animation), `transcript_shift`, `transcript_import` (srt / vtt / lrc), `transcript_translate` (NLLB-200, offline), `transcript_update` also splits / merges lines and edits translations; `captions_set` also takes `language`, `bilingual`, `delay` |
+| Text & speech | `text_templates`, `text_add` (template, style, animation, transform), `text_update`, `text_template_save`, `text_template_delete`, `tts_voices`, `tts_speak` (Windows / Piper / Edge voices), `tts_subtitles` (voice-over or dubbing of the subtitles) |
 | Edit tools | `clip_set_speed` (speed + curves), `clip_reverse`, `clip_freeze_frame`, `clip_duplicate`, `clip_ripple_delete`, `timeline_close_gap`, `timeline_cut_range`; crop and fit/fill go through `clip_update`, aspect ratio through `project_set_settings` |
 | Clips | `clip_list`, `clip_get`, `clip_add` (a video with sound returns its linked audio clip too; `link: false` adds the sound unlinked), `clip_move`, `clip_trim`, `clip_split`, `clip_remove` (these act on linked clips unless `linked: false`), `clip_link` (two ids, or one id to re-link a video with its own sound), `clip_unlink`, `clip_update` (transform, effects, volume, fades) |
 | History | `edit_undo`, `edit_redo`, `edit_history` |
@@ -281,6 +377,8 @@ Disable the endpoint under *Tools > Enable MCP Server* when you don't need it.
 src/
   core/    Project model (tracks, clips, effects), undo, SQLite/JSON persistence
   media/   StemSeparator (Demucs voice/music separation via separator/separate.py),
+           VideoUpscaler (FlashVSR / Real-ESRGAN via separator/upscale.py), SystemProfile
+           (RAM / NVIDIA GPU detection), AiModels (model registry + recommendations),
            FFmpeg probing, video/audio decoders (GPU hwaccel), AudioMixer (gain/pan/
            solo/master, metering, offline analysis), Waveform (timeline peaks), FrameSource,
            HwAccel (decode devices + NVENC/AMF/QSV encoder probing),
@@ -297,7 +395,7 @@ shaders/gl  GLSL 330 (loaded from Qt resources)
 shaders/vk  GLSL 450 -> SPIR-V via glslc, embedded as uint32 arrays
 claude-bridge/  bridge.mjs - Node bridge from the Claude panel to the Claude Agent SDK
 tests/      smoke_test (C++: decode incl. every GPU decoder, editing, persistence, GPU
-            compositing, CPU + GPU export) and mcp_e2e.py (drives all 56 MCP tools), separation_test.py (voice/music quality and lyrics transcription, skipped when the AI tools are not installed)
+            compositing, CPU + GPU export) and mcp_e2e.py (drives all 70 MCP tools), separation_test.py (voice/music quality and lyrics transcription, skipped when the AI tools are not installed)
 ```
 
 Data flow for one frame:
@@ -324,6 +422,7 @@ cmake --preset release
 cmake --build build/release
 ctest --test-dir build/release
 scripts/deploy-windows.sh build/release   # -> dist/VideoEditor (runs without MSYS2)
+ISCC.exe installer/VideoEditor.iss          # -> dist/VideoEditor-Setup-<version>.exe (Inno Setup 6)
 ```
 
 ### Windows (MSVC + vcpkg)
@@ -343,6 +442,13 @@ sudo apt install cmake ninja-build pkg-config qt6-base-dev qt6-multimedia-dev \
   libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
   libsqlite3-dev libvulkan-dev glslc
 cmake --preset release && cmake --build build/release
+```
+
+Release AppImage + tarball (any OS with Docker, from the repository root):
+
+```bash
+docker run --rm -v "$PWD:/src" ubuntu:24.04 bash /src/scripts/build-linux.sh
+# -> dist/VideoEditor-<version>-x86_64.AppImage, dist/VideoEditor-<version>-linux-x86_64.tar.gz
 ```
 
 ### macOS (Homebrew)
@@ -396,5 +502,6 @@ VideoEditor [--renderer opengl|vulkan] [project.veproj | media files...]
 - Export runs on the UI thread, behind a modal progress dialog. Over MCP, `export_video`
   blocks until the file is written and sends no progress notifications.
 - There are no keyframes, transitions beyond fades, text titles, or clip speed changes yet.
-- Only the MSYS2 build has been compiled and tested. The Linux, macOS, and MSVC paths are
-  set up but untested.
+- The MSYS2 (Windows) build is tested. The Linux AppImage is built on Ubuntu 24.04 and
+  smoke-tested there: the GUI starts and the MCP server lists its tools. The macOS and MSVC
+  paths are set up but untested.

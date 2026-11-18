@@ -4,6 +4,7 @@
 #include "media/VideoDecoder.h"
 #include "render/CaptionRenderer.h"
 #include "render/Composite.h"
+#include "render/TextRenderer.h"
 
 #include <QHash>
 
@@ -24,6 +25,7 @@ private:
     QHash<QString, std::shared_ptr<VideoDecoder>> m_decoders; // by clip id (null = failed)
     int m_calls = 0;
     CaptionRenderer m_captions;
+    TextRenderer m_text;
 };
 
 } // namespace ve

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(VideoEditor
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "Basic GPU-accelerated video editor (Qt 6, FFmpeg, OpenGL, Vulkan, SQLite)"
     LANGUAGES CXX)
 
@@ -68,7 +68,14 @@ set(VE_SOURCES
     src/media/Exporter.h          src/media/Exporter.cpp
     src/media/Waveform.h          src/media/Waveform.cpp
     src/media/StemSeparator.h     src/media/StemSeparator.cpp
+    src/media/PythonTask.h        src/media/PythonTask.cpp
+    src/media/SystemProfile.h     src/media/SystemProfile.cpp
+    src/media/AiModels.h          src/media/AiModels.cpp
+    src/media/VideoUpscaler.h     src/media/VideoUpscaler.cpp
     src/render/CaptionRenderer.h  src/render/CaptionRenderer.cpp
+    src/render/TextRenderer.h     src/render/TextRenderer.cpp
+    src/core/TextTemplates.h      src/core/TextTemplates.cpp
+    src/media/Speech.h            src/media/Speech.cpp
     src/media/HwAccel.h           src/media/HwAccel.cpp
 
     src/render/Composite.h        src/render/Composite.cpp
@@ -92,8 +99,14 @@ set(VE_SOURCES
     src/app/GpuSettingsDialog.h   src/app/GpuSettingsDialog.cpp
     src/app/MixerPanel.h          src/app/MixerPanel.cpp
     src/app/ClaudePanel.h         src/app/ClaudePanel.cpp
+    src/app/Theme.h               src/app/Theme.cpp
     src/app/TranscriptPanel.h     src/app/TranscriptPanel.cpp
     src/app/CaptionPanel.h        src/app/CaptionPanel.cpp
+    src/app/AiModelsDialog.h      src/app/AiModelsDialog.cpp
+    src/app/UpscaleDialog.h       src/app/UpscaleDialog.cpp
+    src/app/TextPanel.h           src/app/TextPanel.cpp
+    src/app/SpeechDialog.h        src/app/SpeechDialog.cpp
+    src/app/PreviewInteractor.h   src/app/PreviewInteractor.cpp
 )
 
 if(VE_ENABLE_AUDIO)
@@ -192,6 +205,9 @@ if(VE_BUILD_TESTS)
     enable_testing()
     qt_add_executable(ve_smoke_test tests/smoke_test.cpp)
     target_link_libraries(ve_smoke_test PRIVATE ve_lib)
+    qt_add_executable(ve_preview_interact_test tests/preview_interact_test.cpp)
+    target_link_libraries(ve_preview_interact_test PRIVATE ve_lib)
+    add_test(NAME preview_interact COMMAND ve_preview_interact_test)
     add_test(NAME smoke COMMAND ve_smoke_test "${CMAKE_CURRENT_SOURCE_DIR}/testdata" "${CMAKE_CURRENT_BINARY_DIR}/test-output")
 
     # End-to-end MCP test over stdio (every tool must be exercised).
